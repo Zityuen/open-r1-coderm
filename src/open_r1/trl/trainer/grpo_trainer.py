@@ -1452,6 +1452,23 @@ class GRPOTrainer(Trainer):
                 if self.wandb_log_unique_prompts:
                     df = df.drop_duplicates(subset=["prompt"])
                 wandb.log({"completions": wandb.Table(dataframe=df)})
+            if "swanlab" in self.args.report_to:
+                import pandas as pd
+                import swanlab
+
+                table = {
+                    "step": [str(self.state.global_step)] * len(self._textual_logs["prompt"]),
+                    "prompt": self._textual_logs["prompt"],
+                    "completion": self._textual_logs["completion"],
+                    **self._textual_logs["rewards"],
+                    "advantage": self._textual_logs["advantages"],
+                }
+                df = pd.DataFrame(table)
+                # if self.wandb_log_unique_prompts:
+                #     df = df.drop_duplicates(subset=["prompt"])
+                table = swanlab.echarts.Table()
+                table.add(headers=df.columns.tolist(), rows=df.values.tolist())
+                swanlab.log({"table": table}, step=self.state.global_step)
 
     def create_model_card(
         self,

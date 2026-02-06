@@ -31,6 +31,17 @@ from trl import GRPOTrainer, ModelConfig, TrlParser, get_peft_config
 
 logger = logging.getLogger(__name__)
 
+SYSTEM_PROMPT = """
+Below is a question and it's corresponding code answer. Please write test cases to check the correctness of the code answer. You need to use the unittest library in Python and create a test class for testing.
+"""
+USER_PROMPT = """
+### question
+{question}
+### code solution
+{code_solution}
+Please add detailed comments to the test cases you write. You do not need to test the function's ability to throw exceptions.
+"""
+
 
 def main(script_args, training_args, model_args):
     # Set seed for reproducibility
@@ -88,19 +99,49 @@ def main(script_args, training_args, model_args):
     reward_funcs = get_reward_funcs(script_args)
 
     # Format into conversation
-    def make_conversation(example, prompt_column: str = script_args.dataset_prompt_column):
-        prompt = []
+    def make_conversation(example):
+        prompts = []
+        solutions = []
+        is_correct = []
 
-        if training_args.system_prompt is not None:
-            prompt.append({"role": "system", "content": training_args.system_prompt})
+        for question, correct_sols in zip(example['question'], example['correct_solutions']):
+            for sol in correct_sols:
+                # Handle dictionary structure from dataset (e.g. {'solve_func': '...'})
+                sol_content = sol["solve_func"]
 
-        if prompt_column not in example:
-            raise ValueError(f"Dataset Question Field Error: {prompt_column} is not supported.")
+                prompt = []
+                if training_args.system_prompt is not None:
+                    prompt.append({"role": "system", "content": SYSTEM_PROMPT})
+                prompt.append({"role": "user", "content": USER_PROMPT.format(question=question, code_solution=sol_content)})
+                prompts.append(prompt)
+                solutions.append(sol_content)
+                is_correct.append(True)
 
-        prompt.append({"role": "user", "content": example[prompt_column]})
-        return {"prompt": prompt}
+        for question, wrong_sols in zip(example['question'], example['wrong_solutions']):
+            for sol in wrong_sols:
+                sol_content = sol["solve_func"]
+                prompt = []
+                if training_args.system_prompt is not None:
+                    prompt.append({"role": "system", "content": SYSTEM_PROMPT})
+                prompt.append({"role": "user", "content": USER_PROMPT.format(question=question, code_solution=sol_content)})
+                prompts.append(prompt)
+                solutions.append(sol_content)
+                is_correct.append(False)
 
-    dataset = dataset.map(make_conversation)
+        return {"prompt": prompts, "completion": solutions, "is_correct": is_correct}
+
+    # Remove original columns to avoid length mismatch (ArrowInvalid)
+    # as make_conversation doubles the number of rows (correct + wrong solutions)
+    column_names = list(dataset.values())[0].column_names
+    dataset = dataset.map(make_conversation, batched=True, remove_columns=column_names)
+
+    # Filter out prompts that are too long
+    if training_args.max_prompt_length is not None:
+        def filter_fn(example):
+            tokens = tokenizer.apply_chat_template(example["prompt"], tokenize=True, add_generation_prompt=True)
+            return len(tokens) <= training_args.max_prompt_length
+
+        dataset = dataset.filter(filter_fn)
 
     for split in dataset:
         if "messages" in dataset[split].column_names:

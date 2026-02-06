@@ -18,7 +18,12 @@
 import asyncio
 import json
 import math
+import os
 import re
+import subprocess
+import sys
+import tempfile
+import unittest
 from functools import partial, update_wrapper
 from typing import Callable, Dict, Literal, Optional
 
@@ -591,6 +596,81 @@ def code_reward(
 
     return execution_provider.execute_scripts(scripts, ["python"] * len(scripts))
 
+def unittest_reward(completions, solution, is_correct, **kwargs) -> list[float]:
+    """
+    Reward function that executes the generated unit tests (completion) against the
+    provided solution code. Returns the number of passed tests.
+    """
+    contents = [completion[0]["content"] for completion in completions]
+    rewards = []
+
+    for content, sol in zip(contents, solution):
+        # Extract code from completion (the tests)
+        test_code = extract_code(content)
+        # Fallback: if extract_code returns empty but content looks like code, use it
+        if not test_code and ("def " in content or "class " in content):
+             test_code = content
+
+        # Extract code from solution (the solve function)
+        sol_code = extract_code(sol)
+        if not sol_code:
+            # Assume raw code if no markdown found in solution
+            sol_code = sol
+
+        if not test_code.strip():
+            rewards.append(0.0)
+            continue
+
+        script_content = f"""
+import unittest
+import sys
+from typing import *
+# Solution Code
+{sol_code}
+# Test Code
+{test_code}
+if __name__ == '__main__':
+    loader = unittest.TestLoader()
+    suite = loader.loadTestsFromModule(sys.modules[__name__])
+    runner = unittest.TextTestRunner(verbosity=0, stream=sys.stdout)
+    result = runner.run(suite)
+    passed = result.testsRun - len(result.errors) - len(result.failures)
+    print(f"METRICS:{{passed}}:{{result.testsRun}}")
+"""
+        script_path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+                f.write(script_content)
+                script_path = f.name
+
+            # Execute the script
+            result = subprocess.run(
+                [sys.executable, script_path],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+
+            output = result.stdout
+            match = re.search(r"METRICS:(\d+):(\d+)", output)
+            if match:
+                passed = int(match.group(1))
+                total = int(match.group(2))
+                reward = float(passed) / float(total) if total > 0 else 0.0
+                if not is_correct:
+                    reward = 1 - reward
+                rewards.append(reward)
+            else:
+                rewards.append(0.0)
+
+        except Exception:
+            rewards.append(0.0)
+        finally:
+            if script_path and os.path.exists(script_path):
+                os.remove(script_path)
+
+    return rewards
+
 
 def get_code_format_reward(language: str = "python"):
     """Format reward function specifically for code responses.
@@ -700,6 +780,7 @@ def get_reward_funcs(script_args) -> list[Callable]:
             max_completion_len=script_args.max_completion_len,
             soft_punish_cache=script_args.soft_punish_cache,
         ),
+        "unittest": unittest_reward,
     }
     reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
 
