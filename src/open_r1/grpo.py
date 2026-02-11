@@ -103,8 +103,14 @@ def main(script_args, training_args, model_args):
         prompts = []
         solutions = []
         is_correct = []
+        group_ids = []
 
-        for question, correct_sols in zip(example['question'], example['correct_solutions']):
+        for question, correct_sols, wrong_sols in zip(
+            example['question'], example['correct_solutions'], example['wrong_solutions']
+        ):
+            # Use hash of question text as globally unique group_id across batches
+            gid = hash(question) & 0x7FFFFFFFFFFFFFFF  # ensure non-negative int64
+
             for sol in correct_sols:
                 # Handle dictionary structure from dataset (e.g. {'solve_func': '...'})
                 sol_content = sol["solve_func"]
@@ -116,8 +122,8 @@ def main(script_args, training_args, model_args):
                 prompts.append(prompt)
                 solutions.append(sol_content)
                 is_correct.append(True)
+                group_ids.append(gid)
 
-        for question, wrong_sols in zip(example['question'], example['wrong_solutions']):
             for sol in wrong_sols:
                 sol_content = sol["solve_func"]
                 prompt = []
@@ -127,8 +133,9 @@ def main(script_args, training_args, model_args):
                 prompts.append(prompt)
                 solutions.append(sol_content)
                 is_correct.append(False)
+                group_ids.append(gid)
 
-        return {"prompt": prompts, "completion": solutions, "is_correct": is_correct}
+        return {"prompt": prompts, "completion": solutions, "is_correct": is_correct, "group_id": group_ids}
 
     # Remove original columns to avoid length mismatch (ArrowInvalid)
     # as make_conversation doubles the number of rows (correct + wrong solutions)

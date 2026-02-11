@@ -178,6 +178,141 @@ class RepeatSampler(Sampler):
         return self.num_samples * self.mini_repeat_count * self.repeat_count
 
 
+class GroupRepeatSampler(Sampler):
+    """
+    Sampler that ensures all examples with the same `group_id` are in the same batch.
+    Groups are greedily packed into chunks of up to `batch_size` unique indices, then
+    padded to exactly `batch_size` by cycling existing indices. Each index in a chunk is
+    repeated `mini_repeat_count` times, and each chunk is repeated `repeat_count` times.
+
+    This is used when the dataset contains a `group_id` column and we want advantage
+    normalization to happen across all completions within each group, rather than within
+    fixed `num_generations` blocks.
+
+    Args:
+        data_source (`Sized`):
+            Dataset to sample from.
+        group_ids (`list`):
+            List of group IDs, one per dataset example. Examples sharing a group_id will
+            always appear in the same batch.
+        mini_repeat_count (`int`):
+            Number of times to repeat each index (typically `num_generations`).
+        batch_size (`int`, *optional*, defaults to `1`):
+            Maximum number of unique indices per batch (before mini_repeat_count expansion).
+        repeat_count (`int`, *optional*, defaults to `1`):
+            Number of times to repeat the full sampling process.
+        shuffle (`bool`, *optional*, defaults to `True`):
+            Whether to shuffle the group order.
+        seed (`int` or `None`, *optional*, defaults to `None`):
+            Random seed for reproducibility.
+    """
+
+    def __init__(
+        self,
+        data_source: Sized,
+        group_ids: list,
+        mini_repeat_count: int,
+        batch_size: int = 1,
+        repeat_count: int = 1,
+        shuffle: bool = True,
+        seed: Optional[int] = None,
+    ):
+        self.data_source = data_source
+        self.mini_repeat_count = mini_repeat_count
+        self.batch_size = batch_size
+        self.repeat_count = repeat_count
+        self.num_samples = len(data_source)
+        self.shuffle = shuffle
+        self.seed = seed
+
+        # Build group_id -> [dataset_indices] mapping
+        group_map = defaultdict(list)
+        for idx, gid in enumerate(group_ids):
+            group_map[gid].append(idx)
+        self.group_list = list(group_map.values())
+
+        # Warn about oversized groups
+        max_group_size = max(len(g) for g in self.group_list) if self.group_list else 0
+        if max_group_size > batch_size:
+            warnings.warn(
+                f"GroupRepeatSampler: some groups have {max_group_size} elements, exceeding "
+                f"batch_size={batch_size}. These groups will form oversized batches. "
+                f"Consider increasing generation_batch_size."
+            )
+
+        if shuffle:
+            self.generator = torch.Generator()
+            if seed is not None:
+                self.generator.manual_seed(seed)
+
+        # Pre-compute number of chunks for __len__
+        self._num_chunks = self._count_chunks(self.group_list)
+
+    def _pack_chunks(self, group_list):
+        """Greedily pack groups into chunks of up to batch_size unique indices, padded to batch_size."""
+        chunks = []
+        current_chunk = []
+        current_size = 0
+
+        for group_indices in group_list:
+            group_size = len(group_indices)
+
+            if current_size + group_size > self.batch_size:
+                if current_chunk:
+                    # Pad to batch_size by cycling existing indices
+                    padded = current_chunk.copy()
+                    while len(padded) < self.batch_size:
+                        padded.append(current_chunk[len(padded) % current_size])
+                    chunks.append(padded)
+                current_chunk = []
+                current_size = 0
+
+            current_chunk.extend(group_indices)
+            current_size += group_size
+
+        # Handle last chunk
+        if current_chunk:
+            padded = current_chunk.copy()
+            while len(padded) < self.batch_size:
+                padded.append(current_chunk[len(padded) % current_size])
+            chunks.append(padded)
+
+        return chunks
+
+    def _count_chunks(self, group_list):
+        """Count the number of chunks without building them."""
+        count = 0
+        current_size = 0
+        for group_indices in group_list:
+            group_size = len(group_indices)
+            if current_size + group_size > self.batch_size:
+                if current_size > 0:
+                    count += 1
+                current_size = 0
+            current_size += group_size
+        if current_size > 0:
+            count += 1
+        return count
+
+    def __iter__(self):
+        group_list = list(self.group_list)
+
+        if self.shuffle:
+            perm = torch.randperm(len(group_list), generator=self.generator).tolist()
+            group_list = [group_list[i] for i in perm]
+
+        chunks = self._pack_chunks(group_list)
+
+        for chunk in chunks:
+            for _ in range(self.repeat_count):
+                for index in chunk:
+                    for _ in range(self.mini_repeat_count):
+                        yield index
+
+    def __len__(self) -> int:
+        return self._num_chunks * self.batch_size * self.mini_repeat_count * self.repeat_count
+
+
 # torch.nanstd doesn't exist, so we define it here
 def nanstd(tensor: torch.Tensor) -> torch.Tensor:
     """
@@ -782,6 +917,21 @@ class GRPOTrainer(Trainer):
         #                                          ...
         if dataset is None:
             dataset = self.train_dataset
+
+        # Use GroupRepeatSampler when the dataset has a group_id column, ensuring all
+        # examples from the same group are in the same generation batch for advantage
+        # normalization across the entire group.
+        if hasattr(dataset, "column_names") and "group_id" in dataset.column_names:
+            return GroupRepeatSampler(
+                data_source=dataset,
+                group_ids=dataset["group_id"],
+                mini_repeat_count=self.num_generations,
+                batch_size=self.args.generation_batch_size // self.num_generations,
+                repeat_count=self.num_iterations * self.args.steps_per_generation,
+                shuffle=self.shuffle_dataset,
+                seed=self.args.seed,
+            )
+
         return RepeatSampler(
             data_source=dataset,
             mini_repeat_count=self.num_generations,
@@ -793,6 +943,15 @@ class GRPOTrainer(Trainer):
 
     def _get_eval_sampler(self, eval_dataset) -> Sampler:
         # See _get_train_sampler for an explanation of the sampler.
+        # Use GroupRepeatSampler when the dataset has a group_id column.
+        if hasattr(eval_dataset, "column_names") and "group_id" in eval_dataset.column_names:
+            return GroupRepeatSampler(
+                data_source=eval_dataset,
+                group_ids=eval_dataset["group_id"],
+                mini_repeat_count=self.num_generations,
+                seed=self.args.seed,
+            )
+
         return RepeatSampler(
             data_source=eval_dataset,
             mini_repeat_count=self.num_generations,
@@ -1196,13 +1355,29 @@ class GRPOTrainer(Trainer):
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
 
         # Compute grouped-wise rewards
-        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
-        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
+        # When group_id is available, use it for variable-size group normalization;
+        # otherwise fall back to fixed num_generations grouping.
+        if "group_id" in reward_kwargs:
+            group_ids_local = torch.tensor(reward_kwargs["group_id"], dtype=torch.long, device=device)
+            group_ids = gather(group_ids_local)
+
+            # Compute per-group mean and std using group_id
+            unique_groups, inverse_indices = group_ids.unique(return_inverse=True)
+            mean_grouped_rewards = torch.zeros_like(rewards)
+            std_grouped_rewards = torch.zeros_like(rewards)
+            for i, gid in enumerate(unique_groups):
+                mask = inverse_indices == i
+                mean_grouped_rewards[mask] = rewards[mask].mean()
+                std_grouped_rewards[mask] = rewards[mask].std()
+        else:
+            mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
+            std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
+            mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+            std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+
         is_std_zero = torch.isclose(std_grouped_rewards, torch.zeros_like(std_grouped_rewards))
 
         # Normalize the rewards to compute the advantages
-        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         advantages = rewards - mean_grouped_rewards
         if self.scale_rewards:
             advantages = advantages / (std_grouped_rewards + 1e-4)
