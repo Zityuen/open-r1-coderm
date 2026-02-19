@@ -672,6 +672,85 @@ if __name__ == '__main__':
     return rewards
 
 
+def _run_tests(test_code: str, sol_code: str, timeout: int = 5) -> float:
+    """
+    Run unit test code against a solution. Returns passed/total as a float.
+    If execution fails or no tests are found, returns 0.0.
+    """
+    if not test_code.strip() or not sol_code.strip():
+        return 0.0
+
+    script_content = f"""
+import unittest
+import sys
+from typing import *
+# Solution Code
+{sol_code}
+# Test Code
+{test_code}
+if __name__ == '__main__':
+    loader = unittest.TestLoader()
+    suite = loader.loadTestsFromModule(sys.modules[__name__])
+    runner = unittest.TextTestRunner(verbosity=0, stream=sys.stdout)
+    result = runner.run(suite)
+    passed = result.testsRun - len(result.errors) - len(result.failures)
+    print(f"METRICS:{{passed}}:{{result.testsRun}}")
+"""
+    script_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+            f.write(script_content)
+            script_path = f.name
+
+        result = subprocess.run(
+            [sys.executable, script_path],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+        output = result.stdout
+        match = re.search(r"METRICS:(\d+):(\d+)", output)
+        if match:
+            passed = int(match.group(1))
+            total = int(match.group(2))
+            return float(passed) / float(total) if total > 0 else 0.0
+        return 0.0
+    except Exception:
+        return 0.0
+    finally:
+        if script_path and os.path.exists(script_path):
+            os.remove(script_path)
+
+
+def cross_solution_unittest_reward(
+    completion_text: str,
+    solutions: list[dict],
+    timeout: int = 5,
+) -> float:
+    """
+    Run unit tests extracted from a single completion against all provided solutions.
+    For correct solutions, score = pass_rate. For wrong solutions, score = 1 - pass_rate.
+    Returns the mean score across all solutions.
+    """
+    test_code = extract_code(completion_text)
+    if not test_code and ("def " in completion_text or "class " in completion_text):
+        test_code = completion_text
+
+    if not test_code.strip():
+        return 0.0
+
+    scores = []
+    for sol_info in solutions:
+        sol_code = sol_info["solve_func"]
+        is_correct = sol_info["is_correct"]
+        pass_rate = _run_tests(test_code, sol_code, timeout=timeout)
+        score = pass_rate if is_correct else (1.0 - pass_rate)
+        scores.append(score)
+
+    return sum(scores) / len(scores) if scores else 0.0
+
+
 def get_code_format_reward(language: str = "python"):
     """Format reward function specifically for code responses.
 

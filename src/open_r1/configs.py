@@ -329,3 +329,12 @@ class GRPOScriptArguments(ScriptArguments):
         default=4096,
         metadata={"help": "Minimum number of characters in completion."},
     )
+
+    num_sampled_solutions: int = field(
+        default=4,
+        metadata={"help": "Number of solutions to sample per question (m). Must satisfy m * n = num_generations."},
+    )
+    num_completions_per_solution: int = field(
+        default=4,
+        metadata={"help": "Number of completions to generate per sampled solution (n). Must satisfy m * n = num_generations."},
+    )

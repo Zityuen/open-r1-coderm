@@ -22,11 +22,12 @@ from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
 
 from open_r1.configs import GRPOConfig, GRPOScriptArguments
+from open_r1.grouped_sol_grpo_trainer import GroupedSolGRPOTrainer
 from open_r1.rewards import get_reward_funcs
 from open_r1.utils import get_dataset, get_model, get_tokenizer
 from open_r1.utils.callbacks import get_callbacks
 from open_r1.utils.wandb_logging import init_wandb_training
-from trl import GRPOTrainer, ModelConfig, TrlParser, get_peft_config
+from trl import ModelConfig, TrlParser, get_peft_config
 
 
 logger = logging.getLogger(__name__)
@@ -98,47 +99,47 @@ def main(script_args, training_args, model_args):
     # Get reward functions from the registry
     reward_funcs = get_reward_funcs(script_args)
 
-    # Format into conversation
+    # Group all solutions per question into one row
     def make_conversation(example):
-        prompts = []
-        solutions = []
-        is_correct = []
+        questions = []
+        all_solutions = []
 
-        for question, correct_sols in zip(example['question'], example['correct_solutions']):
+        for question, correct_sols, wrong_sols in zip(
+            example['question'], example['correct_solutions'], example['wrong_solutions']
+        ):
+            questions.append(question)
+            sols = []
             for sol in correct_sols:
-                # Handle dictionary structure from dataset (e.g. {'solve_func': '...'})
-                sol_content = sol["solve_func"]
-
-                prompt = []
-                if training_args.system_prompt is not None:
-                    prompt.append({"role": "system", "content": SYSTEM_PROMPT})
-                prompt.append({"role": "user", "content": USER_PROMPT.format(question=question, code_solution=sol_content)})
-                prompts.append(prompt)
-                solutions.append(sol_content)
-                is_correct.append(True)
-
-        for question, wrong_sols in zip(example['question'], example['wrong_solutions']):
+                sols.append({"solve_func": sol["solve_func"], "is_correct": True})
             for sol in wrong_sols:
-                sol_content = sol["solve_func"]
-                prompt = []
-                if training_args.system_prompt is not None:
-                    prompt.append({"role": "system", "content": SYSTEM_PROMPT})
-                prompt.append({"role": "user", "content": USER_PROMPT.format(question=question, code_solution=sol_content)})
-                prompts.append(prompt)
-                solutions.append(sol_content)
-                is_correct.append(False)
+                sols.append({"solve_func": sol["solve_func"], "is_correct": False})
+            all_solutions.append(sols)
 
-        return {"prompt": prompts, "completion": solutions, "is_correct": is_correct}
+        return {"prompt_question": questions, "solutions": all_solutions}
 
     # Remove original columns to avoid length mismatch (ArrowInvalid)
     # as make_conversation doubles the number of rows (correct + wrong solutions)
     column_names = list(dataset.values())[0].column_names
     dataset = dataset.map(make_conversation, batched=True, remove_columns=column_names)
 
-    # Filter out prompts that are too long
+    # Filter out examples whose longest possible prompt exceeds the limit
     if training_args.max_prompt_length is not None:
         def filter_fn(example):
-            tokens = tokenizer.apply_chat_template(example["prompt"], tokenize=True, add_generation_prompt=True)
+            question = example["prompt_question"]
+            solutions = example["solutions"]
+            longest_sol = max(
+                (sol["solve_func"] for sol in solutions),
+                key=len,
+                default="",
+            )
+            prompt = []
+            if training_args.system_prompt is not None:
+                prompt.append({"role": "system", "content": SYSTEM_PROMPT})
+            prompt.append({
+                "role": "user",
+                "content": USER_PROMPT.format(question=question, code_solution=longest_sol),
+            })
+            tokens = tokenizer.apply_chat_template(prompt, tokenize=True, add_generation_prompt=True)
             return len(tokens) <= training_args.max_prompt_length
 
         dataset = dataset.filter(filter_fn)
@@ -150,7 +151,15 @@ def main(script_args, training_args, model_args):
     #############################
     # Initialize the GRPO trainer
     #############################
-    trainer = GRPOTrainer(
+    m = script_args.num_sampled_solutions
+    n = script_args.num_completions_per_solution
+    if m * n != training_args.num_generations:
+        raise ValueError(
+            f"num_sampled_solutions ({m}) * num_completions_per_solution ({n}) = {m * n} "
+            f"must equal num_generations ({training_args.num_generations})"
+        )
+
+    trainer = GroupedSolGRPOTrainer(
         model=model,
         reward_funcs=reward_funcs,
         args=training_args,
@@ -159,6 +168,10 @@ def main(script_args, training_args, model_args):
         peft_config=get_peft_config(model_args),
         callbacks=get_callbacks(training_args, model_args),
         processing_class=tokenizer,
+        num_sampled_solutions=m,
+        num_completions_per_solution=n,
+        system_prompt_template=SYSTEM_PROMPT if training_args.system_prompt is not None else None,
+        user_prompt_template=USER_PROMPT,
     )
 
     ###############
