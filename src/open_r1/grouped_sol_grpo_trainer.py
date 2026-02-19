@@ -57,6 +57,28 @@ class GroupedSolGRPOTrainer(GRPOTrainer):
                 f"must equal num_generations ({self.num_generations}), got {self.m * self.n}"
             )
 
+        # # Check if cross_solution_unittest_reward is in reward_funcs and remove it
+        # # because it is handled specifically in _generate_and_score_completions
+        # cross_sol_weight = 1.0
+        # if cross_solution_unittest_reward in self.reward_funcs:
+        #     idx = self.reward_funcs.index(cross_solution_unittest_reward)
+        #     # Extract weight
+        #     if self.reward_weights is not None:
+        #         cross_sol_weight = self.reward_weights[idx].item()
+        #         # Remove from weights
+        #         self.reward_weights = torch.cat([self.reward_weights[:idx], self.reward_weights[idx+1:]])
+            
+        #     # Remove from funcs and names
+        #     self.reward_funcs.pop(idx)
+        #     self.reward_func_names.pop(idx)
+        #     if self.reward_processing_classes is not None:
+        #         self.reward_processing_classes.pop(idx)
+
+        # self._all_reward_func_names = ["cross_solution_unittest"] + list(self.reward_func_names)
+        # self._all_reward_weights = torch.cat([
+        #     torch.tensor([cross_sol_weight], dtype=torch.float32),
+        #     self.reward_weights,
+        # ])
         self._all_reward_func_names = ["cross_solution_unittest"] + list(self.reward_func_names)
         self._all_reward_weights = torch.cat([
             torch.ones(1, dtype=torch.float32),

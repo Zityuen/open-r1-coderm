@@ -860,6 +860,7 @@ def get_reward_funcs(script_args) -> list[Callable]:
             soft_punish_cache=script_args.soft_punish_cache,
         ),
         "unittest": unittest_reward,
+        # "cross_solution_unittest": cross_solution_unittest_reward,
     }
     reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
 
