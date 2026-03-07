@@ -42,6 +42,7 @@ class GroupedSolGRPOTrainer(GRPOTrainer):
         num_completions_per_solution: int = 4,
         system_prompt_template: Optional[str] = None,
         user_prompt_template: str = "",
+        reward_aggregation_expr: Optional[str] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -50,6 +51,7 @@ class GroupedSolGRPOTrainer(GRPOTrainer):
         self.n = num_completions_per_solution
         self.system_prompt_template = system_prompt_template
         self.user_prompt_template = user_prompt_template
+        self.reward_aggregation_expr = reward_aggregation_expr
 
         if self.m * self.n != self.num_generations:
             raise ValueError(
@@ -327,7 +329,10 @@ class GroupedSolGRPOTrainer(GRPOTrainer):
         for idx in range(len(completions_text)):
             group_idx = idx // self.num_generations
             sols = group_sampled_solutions[group_idx]
-            r = cross_solution_unittest_reward(completions_text[idx], sols)
+            r = cross_solution_unittest_reward(
+                completions_text[idx], sols,
+                reward_aggregation_expr=self.reward_aggregation_expr,
+            )
             cross_sol_rewards.append(r)
         rewards_per_func[:, 0] = torch.tensor(
             cross_sol_rewards, dtype=torch.float32, device=device,

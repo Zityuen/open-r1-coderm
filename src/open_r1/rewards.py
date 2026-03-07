@@ -28,6 +28,8 @@ import unittest
 from functools import partial, update_wrapper
 from typing import Callable, Dict, Literal, Optional
 
+import numpy as np
+
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
 
@@ -673,13 +675,13 @@ if __name__ == '__main__':
     return rewards
 
 
-def _run_unittest_with_per_test_metrics(
+def _execute_unittest_suite(
     test_code: str,
     sol_code: str,
     timeout: int = 5,
 ) -> dict[str, int]:
     """
-    Execute the full unittest suite once and return a per-test pass/fail map.
+    Execute the full unittest suite once for a single solution and return a per-test pass/fail map.
 
     The returned dict maps each test id (e.g. '__main__.Test.test1') to:
       1 if the test passed,
@@ -761,68 +763,68 @@ if __name__ == '__main__':
             os.remove(script_path)
 
 
-def _compute_bik_matrices(
+def _run_unittest_with_per_test_metrics(
     test_code: str,
     solutions: list[dict],
     timeout: int = 5,
-) -> tuple[list[str], list[list[float]], list[list[float]]]:
+) -> tuple[np.ndarray, list[str]]:
     """
-    Compute B_ik values grouped by semantic test f_k.
+    Execute the unittest suite against every solution and return the B_ik binary matrix.
+
+    Args:
+        test_code: The generated unittest code to evaluate.
+        solutions: List of dicts with keys ``"solve_func"`` (str) and ``"is_correct"`` (bool).
+        timeout: Timeout in seconds for each individual execution.
 
     Returns:
-        canonical_test_ids: Ordered semantic test ids (f_k).
-        B_correct_matrix: K x M+ matrix; row k contains B_ik over correct solutions.
-        B_wrong_matrix: K x M- matrix; row k contains B_ik over wrong solutions.
+        A tuple ``(B_ik, test_ids)`` where:
+
+        - ``B_ik`` is a numpy ``int`` array of shape ``(len(solutions), K)``.
+          ``B_ik[i, k] == 1`` iff solution *i* passes test function *k*.
+        - ``test_ids`` is the canonical ordering of the *K* test-function identifiers
+          (e.g. ``'__main__.TestFoo.test_bar'``).
     """
-    if not test_code.strip() or not solutions:
-        return [], [], []
+    if not test_code.strip():
+        return np.empty((0, 0), dtype=int), []
 
-    correct_indices = [i for i, s in enumerate(solutions) if s["is_correct"]]
-    wrong_indices = [i for i, s in enumerate(solutions) if not s["is_correct"]]
-
+    # Run the suite once per solution and collect raw per-test dicts
     per_solution_metrics: list[dict[str, int]] = []
     canonical_test_ids: list[str] = []
 
     for sol in solutions:
         sol_code = sol["solve_func"]
-        metrics = _run_unittest_with_per_test_metrics(test_code, sol_code, timeout=timeout)
+        metrics = _execute_unittest_suite(test_code, sol_code, timeout=timeout)
         per_solution_metrics.append(metrics)
-        # Use the first non-empty metrics dict to fix semantic-test order.
+        # Fix the canonical ordering from the first non-empty result
         if not canonical_test_ids and metrics:
             canonical_test_ids = list(metrics.keys())
 
     if not canonical_test_ids:
-        return [], [], []
+        return np.empty((len(solutions), 0), dtype=int), []
 
-    B_correct_matrix: list[list[float]] = []
-    B_wrong_matrix: list[list[float]] = []
+    # Assemble the B_ik matrix: rows = solutions, columns = test functions
+    B_ik = np.array(
+        [[metrics.get(tid, 0) for tid in canonical_test_ids] for metrics in per_solution_metrics],
+        dtype=int,
+    )
 
-    for test_id in canonical_test_ids:
-        B_correct_row = [float(per_solution_metrics[idx].get(test_id, 0)) for idx in correct_indices]
-        B_wrong_row = [float(per_solution_metrics[idx].get(test_id, 0)) for idx in wrong_indices]
-        B_correct_matrix.append(B_correct_row)
-        B_wrong_matrix.append(B_wrong_row)
-
-    return canonical_test_ids, B_correct_matrix, B_wrong_matrix
+    return B_ik, canonical_test_ids
 
 
-def cross_solution_unittest_reward(
-    completion_text: str,
-    solutions: list[dict],
+def _default_eq10_aggregation(
+    B: np.ndarray,
+    correct_mask: np.ndarray,
     lambda_1: float = 0.1,
     lambda_2: float = 0.1,
     lambda_t: float = 0.5,
-    timeout: int = 5,
 ) -> float:
     """
-    Compute reward for generated unit tests using Equation 10 formulation.
+    Default aggregation: Equation 10 formulation (numpy vectorised).
 
-    Each semantic test function f_k (individual test_xxx method) is evaluated
-    against all solutions. The reward combines:
-      R^1_{f_k} (validity):       encourages f_k to pass all correct solutions
-      R^-_{f_k} (discrimination): encourages f_k to fail at least one wrong solution
+    Each semantic test function f_k is evaluated against all solutions.
+    The reward combines validity (R^1) and discrimination (R^-).
 
-    Formulas (Equation 10):
+    Formulas:
       R^1_{f_k} = prod(B_ik, i in correct) + (lambda_1 / M+) * sum(B_ik, i in correct)
       R^-_{f_k} = prod(B_ik, i in correct) * (1 - prod(B_ik, i in wrong))
                   - (lambda_2 / M-) * sum(B_ik, i in wrong)
@@ -830,110 +832,102 @@ def cross_solution_unittest_reward(
       R         = mean(R_{f_k}) over all k
 
     Args:
-        completion_text: Model completion containing unittest code with test methods.
-        solutions: List of dicts with keys "solve_func" (str) and "is_correct" (bool).
-        lambda_1: Soft validity coefficient (default 0.1).
-        lambda_2: Soft discrimination penalty coefficient (default 0.1).
-        lambda_t: Weight between validity and discrimination (default 0.5).
-        timeout: Timeout in seconds for each test execution.
+        B: ``np.ndarray`` of shape ``(num_solutions, K)`` with dtype int.
+        correct_mask: ``np.ndarray`` of shape ``(num_solutions,)`` with dtype bool.
+        lambda_1: Soft validity coefficient.
+        lambda_2: Soft discrimination penalty coefficient.
+        lambda_t: Weight between validity and discrimination.
 
     Returns:
-        Float reward in roughly [-lambda_2, 1 + lambda_1].
+        Float reward in roughly ``[-lambda_2, 1 + lambda_1]``.
     """
-    test_code = extract_code(completion_text)
-    if not test_code and ("def " in completion_text or "class " in completion_text):
-        test_code = completion_text
+    B = np.asarray(B, dtype=float)
+    correct_mask = np.asarray(correct_mask, dtype=bool)
 
-    if not test_code.strip():
+    K = B.shape[1] if B.ndim == 2 and B.shape[0] > 0 else 0
+    if K == 0:
         return 0.0
 
-    # Prepare index mapping for correct / wrong solutions
-    correct_indices = [i for i, s in enumerate(solutions) if s["is_correct"]]
-    wrong_indices = [i for i, s in enumerate(solutions) if not s["is_correct"]]
-    M_plus = len(correct_indices)
-    M_minus = len(wrong_indices)
+    B_correct = B[correct_mask]    # (M_plus, K)
+    B_wrong = B[~correct_mask]     # (M_minus, K)
+    M_plus = B_correct.shape[0]
+    M_minus = B_wrong.shape[0]
 
-    if M_plus + M_minus == 0:
-        return 0.0
+    # Vectorised across all K test functions
+    prod_correct = np.prod(B_correct, axis=0)  # (K,)  — empty → ones
+    sum_correct = np.sum(B_correct, axis=0)    # (K,)  — empty → zeros
+    prod_wrong = np.prod(B_wrong, axis=0)      # (K,)  — empty → ones
+    sum_wrong = np.sum(B_wrong, axis=0)        # (K,)  — empty → zeros
 
-    canonical_test_ids, B_correct_matrix, B_wrong_matrix = _compute_bik_matrices(
-        test_code=test_code,
-        solutions=solutions,
-        timeout=timeout,
-    )
-
-    if not canonical_test_ids:
-        return 0.0
-
-    K = len(canonical_test_ids)
-
-    R_fk_scores: list[float] = []
-    B_matrix: list[list[float]] = []  # B_matrix[k] = B_correct_k + B_wrong_k
-    R_details: list[tuple[float, float, float]] = []  # (R1, R_minus, R_fk) per f_k
-
-    for k, _ in enumerate(canonical_test_ids):
-        B_correct = B_correct_matrix[k]
-        B_wrong = B_wrong_matrix[k]
-
-        B_matrix.append(B_correct + B_wrong)
-
-        # R^1_{f_k} (validity)
-        prod_correct = 1.0
-        for b in B_correct:
-            prod_correct *= b
-        sum_correct = sum(B_correct)
-        R1 = prod_correct + (lambda_1 / M_plus * sum_correct if M_plus > 0 else 0.0)
-
-        # R^-_{f_k} (discrimination)
-        prod_wrong = 1.0
-        for b in B_wrong:
-            prod_wrong *= b
-        sum_wrong = sum(B_wrong)
-        R_minus = prod_correct * (1.0 - prod_wrong) - (
-            lambda_2 / M_minus * sum_wrong if M_minus > 0 else 0.0
-        )
-
-        # R_{f_k} = lambda_t * R^1 + (1 - lambda_t) * R^-
-        R_fk = lambda_t * R1 + (1.0 - lambda_t) * R_minus
-        R_fk_scores.append(R_fk)
-        R_details.append((R1, R_minus, R_fk))
+    R1 = prod_correct + lambda_1 / max(M_plus, 1) * sum_correct
+    R_minus = prod_correct * (1.0 - prod_wrong) - lambda_2 / max(M_minus, 1) * sum_wrong
+    R_fk = lambda_t * R1 + (1.0 - lambda_t) * R_minus
 
     # ── Print B_ik matrix and per-f_k reward breakdown ──
-    header = "B_ik matrix (rows=f_k, cols=solutions [correct | wrong]):"
     col_labels = [f"s+{i}" for i in range(M_plus)] + [f"s-{i}" for i in range(M_minus)]
     col_header = "        " + "  ".join(f"{c:>4}" for c in col_labels)
-    print(header)
+    print("B_ik matrix (rows=f_k, cols=solutions [correct | wrong]):")
     print(col_header)
-    for k, row in enumerate(B_matrix):
-        vals = "  ".join(f"{int(v):>4}" for v in row)
-        print(f"  f_{k+1:>2}:  {vals}")
+    # Display with correct solutions first, then wrong
+    B_display = np.hstack([B_correct.T, B_wrong.T]) if M_minus > 0 else B_correct.T  # (K, M)
+    for k_idx in range(K):
+        vals = "  ".join(f"{int(v):>4}" for v in B_display[k_idx])
+        print(f"  f_{k_idx + 1:>2}:  {vals}")
     print("Per-f_k rewards:")
-    for k, (r1, rm, rfk) in enumerate(R_details):
-        print(f"  f_{k+1:>2}: R^1={r1:.4f}, R^-={rm:.4f}, R_fk={rfk:.4f}")
-    final_reward = sum(R_fk_scores) / K
+    for k_idx in range(K):
+        print(f"  f_{k_idx + 1:>2}: R^1={R1[k_idx]:.4f}, R^-={R_minus[k_idx]:.4f}, R_fk={R_fk[k_idx]:.4f}")
+    final_reward = float(np.mean(R_fk))
     print(f"Final reward = {final_reward:.4f} (K={K})")
 
     return final_reward
 
 
-def cross_solution_unittest_reward_v2(
+def cross_solution_unittest_reward(
     completion_text: str,
     solutions: list[dict],
+    reward_aggregation_expr: Optional[str] = None,
+    lambda_1: float = 0.1,
+    lambda_2: float = 0.1,
+    lambda_t: float = 0.5,
     timeout: int = 5,
 ) -> float:
     """
-    Compute reward for generated unit tests (v2).
+    Compute reward for generated unit tests by cross-executing them against
+    multiple solutions.
 
-    Changes vs v1:
-      - Remove lambda_1 soft-validity term from R^1.
-      - Remove lambda_2 soft-discrimination penalty from R^-.
-      - Combine as direct sum: R_{f_k} = R^1 + R^- (no lambda_t weighting).
+    The function first builds the binary matrix **B_ik** via
+    :func:`_run_unittest_with_per_test_metrics` (``B[i][k] == 1`` iff solution
+    *i* passes test function *k*), then aggregates the matrix into a scalar
+    reward.
 
-    Formulas:
-      R^1_{f_k} = prod(B_ik, i in correct)
-      R^-_{f_k} = prod(B_ik, i in correct) * (1 - prod(B_ik, i in wrong))
-      R_{f_k}   = R^1 + R^-
-      R         = mean(R_{f_k}) over all k
+    Aggregation can be customised through ``reward_aggregation_expr``:
+
+    * **None** (default) — uses the built-in Equation 10 formulation
+      (see :func:`_default_eq10_aggregation`).
+    * **A Python eval-able string** — the expression is ``eval()``'d with the
+      following variables in scope:
+
+        - ``B``  (``np.ndarray``): int array of shape ``(num_solutions, K)``.
+        - ``correct_mask`` (``np.ndarray``): bool array of shape ``(num_solutions,)``.
+        - ``M_plus`` (``int``): number of correct solutions.
+        - ``M_minus`` (``int``): number of wrong solutions.
+        - ``K`` (``int``): number of test functions.
+        - ``np``: the ``numpy`` module.
+        - ``math``: the standard-library ``math`` module.
+
+      The expression must evaluate to a ``float``.
+
+    Args:
+        completion_text: Model completion containing unittest code with test methods.
+        solutions: List of dicts with keys ``"solve_func"`` (str) and ``"is_correct"`` (bool).
+        reward_aggregation_expr: Python eval-able aggregation expression (see above).
+        lambda_1: Soft validity coefficient (default 0.1, used by default Eq. 10).
+        lambda_2: Soft discrimination penalty coefficient (default 0.1).
+        lambda_t: Weight between validity and discrimination (default 0.5).
+        timeout: Timeout in seconds for each test execution.
+
+    Returns:
+        Float reward.
     """
     test_code = extract_code(completion_text)
     if not test_code and ("def " in completion_text or "class " in completion_text):
@@ -942,61 +936,61 @@ def cross_solution_unittest_reward_v2(
     if not test_code.strip():
         return 0.0
 
-    correct_indices = [i for i, s in enumerate(solutions) if s["is_correct"]]
-    wrong_indices = [i for i, s in enumerate(solutions) if not s["is_correct"]]
-    M_plus = len(correct_indices)
-    M_minus = len(wrong_indices)
+    correct_mask = np.array([s["is_correct"] for s in solutions], dtype=bool)
+    M_plus = int(correct_mask.sum())
+    M_minus = len(correct_mask) - M_plus
 
     if M_plus + M_minus == 0:
         return 0.0
 
-    canonical_test_ids, B_correct_matrix, B_wrong_matrix = _compute_bik_matrices(
-        test_code=test_code,
-        solutions=solutions,
-        timeout=timeout,
-    )
-    if not canonical_test_ids:
+    # Build the B_ik matrix via the unified interface
+    B, test_ids = _run_unittest_with_per_test_metrics(test_code, solutions, timeout=timeout)
+
+    if B.size == 0 or not test_ids:
         return 0.0
 
-    K = len(canonical_test_ids)
-    R_fk_scores: list[float] = []
-    B_matrix: list[list[float]] = []  # B_matrix[k] = B_correct_k + B_wrong_k
-    R_details: list[tuple[float, float, float]] = []  # (R1, R_minus, R_fk) per f_k
+    K = len(test_ids)
 
-    for k, _ in enumerate(canonical_test_ids):
-        B_correct = B_correct_matrix[k]
-        B_wrong = B_wrong_matrix[k]
-        B_matrix.append(B_correct + B_wrong)
-
-        prod_correct = 1.0
-        for b in B_correct:
-            prod_correct *= b
-        R1 = prod_correct
-
-        prod_wrong = 1.0
-        for b in B_wrong:
-            prod_wrong *= b
-        R_minus = prod_correct * (1.0 - prod_wrong)
-
-        R_fk = R1 + R_minus
-        R_fk_scores.append(R_fk)
-        R_details.append((R1, R_minus, R_fk))
-
-    header = "B_ik matrix (rows=f_k, cols=solutions [correct | wrong]):"
-    col_labels = [f"s+{i}" for i in range(M_plus)] + [f"s-{i}" for i in range(M_minus)]
-    col_header = "        " + "  ".join(f"{c:>4}" for c in col_labels)
-    print(header)
-    print(col_header)
-    for k, row in enumerate(B_matrix):
-        vals = "  ".join(f"{int(v):>4}" for v in row)
-        print(f"  f_{k+1:>2}:  {vals}")
-    print("Per-f_k rewards (v2):")
-    for k, (r1, rm, rfk) in enumerate(R_details):
-        print(f"  f_{k+1:>2}: R^1={r1:.4f}, R^-={rm:.4f}, R_fk={rfk:.4f}")
-    final_reward = sum(R_fk_scores) / K
-    print(f"Final reward v2 = {final_reward:.4f} (K={K})")
-
-    return final_reward
+    # Aggregate B_ik into a scalar reward
+    if reward_aggregation_expr is None:
+        # Default: Equation 10
+        return _default_eq10_aggregation(
+            B, correct_mask,
+            lambda_1=lambda_1, lambda_2=lambda_2, lambda_t=lambda_t,
+        )
+    else:
+        # Custom aggregation via eval.
+        # NOTE: all variables must live in the *globals* dict because Python 3
+        # comprehensions / generator expressions create implicit function scopes
+        # that only close over globals — not eval()'s locals dict.
+        eval_globals = {
+            "__builtins__": {},
+            "B": B,
+            "correct_mask": correct_mask,
+            "M_plus": M_plus,
+            "M_minus": M_minus,
+            "K": K,
+            "np": np,
+            "math": math,
+            "sum": sum,
+            "len": len,
+            "min": min,
+            "max": max,
+            "float": float,
+            "int": int,
+            "range": range,
+            "zip": zip,
+            "enumerate": enumerate,
+            "all": all,
+            "any": any,
+            "abs": abs,
+        }
+        try:
+            reward = eval(reward_aggregation_expr, eval_globals)
+            return float(reward)
+        except Exception as e:
+            print(f"[cross_solution_unittest_reward] aggregation eval failed: {e}")
+            return 0.0
 
 
 def get_code_format_reward(language: str = "python"):

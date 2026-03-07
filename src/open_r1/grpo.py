@@ -183,6 +183,7 @@ def main(script_args, training_args, model_args):
         num_completions_per_solution=n,
         system_prompt_template=SYSTEM_PROMPT if training_args.system_prompt is not None else None,
         user_prompt_template=USER_PROMPT,
+        reward_aggregation_expr=script_args.unittest_reward_aggregation,
     )
 
     ###############
