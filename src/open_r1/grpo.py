@@ -44,7 +44,17 @@ Please add detailed comments to the test cases you write. You do not need to tes
 """
 
 
-def main(script_args, training_args, model_args):
+def _extract_config_path_from_argv(argv):
+    """Extract CLI config path from --config PATH or --config=PATH."""
+    for i, arg in enumerate(argv):
+        if arg == "--config" and i + 1 < len(argv):
+            return os.path.abspath(argv[i + 1])
+        if arg.startswith("--config="):
+            return os.path.abspath(arg.split("=", 1)[1])
+    return None
+
+
+def main(script_args, training_args, model_args, cli_config_path=None):
     # Set seed for reproducibility
     set_seed(training_args.seed)
 
@@ -81,6 +91,10 @@ def main(script_args, training_args, model_args):
 
     if "wandb" in training_args.report_to:
         init_wandb_training(training_args)
+    if "swanlab" in training_args.report_to and cli_config_path:
+        import swanlab
+
+        swanlab.init(config=cli_config_path)
 
     # Load the dataset
     dataset = get_dataset(script_args)
@@ -241,6 +255,7 @@ def main(script_args, training_args, model_args):
 
 
 if __name__ == "__main__":
+    cli_config_path = _extract_config_path_from_argv(sys.argv[1:])
     parser = TrlParser((GRPOScriptArguments, GRPOConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
-    main(script_args, training_args, model_args)
+    main(script_args, training_args, model_args, cli_config_path=cli_config_path)
