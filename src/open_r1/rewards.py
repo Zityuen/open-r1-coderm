@@ -29,6 +29,8 @@ import unittest
 from functools import partial, update_wrapper
 from typing import Callable, Dict, Literal, Optional
 
+import numpy as np
+
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
 
