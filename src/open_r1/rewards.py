@@ -1318,13 +1318,31 @@ def get_reward_funcs(script_args) -> list[Callable]:
             reward_funcs.append(dynamic_cross_solution_reward)
             continue
 
+        # Handle custom unittest_* reward expressions from config
+        if func_name.startswith("unittest_") and func_name != "unittest":
+            custom_expr = getattr(script_args, func_name, None)
+            if custom_expr:
+                # Create a reward function using the custom expression
+                custom_reward = _make_cross_solution_batch_reward(
+                    update_wrapper(
+                        partial(
+                            cross_solution_unittest_reward,
+                            reward_aggregation_expr=custom_expr,
+                        ),
+                        cross_solution_unittest_reward,
+                    )
+                )
+                reward_funcs.append(custom_reward)
+                continue
+
         available = ", ".join(sorted(REWARD_FUNCS_REGISTRY.keys()))
         raise ValueError(
             f"Unknown reward function '{func_name}'. "
             f"Available registry rewards: {available}. "
             "For grouped-solution rewards, you can also use names like "
             "'cross_solution_unittest_v3' if the matching "
-            "'cross_solution_unittest_reward_v3' function exists."
+            "'cross_solution_unittest_reward_v3' function exists. "
+            "For custom unittest rewards, define '{func_name}' in your config yaml."
         )
 
     return reward_funcs
