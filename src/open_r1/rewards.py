@@ -1071,10 +1071,11 @@ def _resolve_cross_solution_reward_from_name(
         )
     # Bake in the aggregation expression if provided.
     if reward_aggregation_expr is not None:
-        single_func = update_wrapper(
-            partial(single_func, reward_aggregation_expr=reward_aggregation_expr),
-            single_func,
-        )
+        partial_func = partial(single_func, reward_aggregation_expr=reward_aggregation_expr)
+        # Preserve the original function name to avoid logging collisions
+        partial_func.__name__ = single_name
+        partial_func.__doc__ = single_func.__doc__
+        single_func = partial_func
 
     return _make_cross_solution_batch_reward(single_func)
 
@@ -1325,15 +1326,14 @@ def get_reward_funcs(script_args) -> list[Callable]:
             custom_expr = getattr(script_args, func_name, None)
             if custom_expr:
                 # Create a reward function using the custom expression
-                custom_reward = _make_cross_solution_batch_reward(
-                    update_wrapper(
-                        partial(
-                            cross_solution_unittest_reward,
-                            reward_aggregation_expr=custom_expr,
-                        ),
-                        cross_solution_unittest_reward,
-                    )
+                base_func = partial(
+                    cross_solution_unittest_reward,
+                    reward_aggregation_expr=custom_expr,
                 )
+                # Set unique name to avoid logging collisions
+                base_func.__name__ = func_name
+                base_func.__doc__ = f"Custom reward: {func_name}"
+                custom_reward = _make_cross_solution_batch_reward(base_func)
                 reward_funcs.append(custom_reward)
                 continue
 
