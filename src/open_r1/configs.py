@@ -349,3 +349,12 @@ class GRPOScriptArguments(ScriptArguments):
             "enumerate, all, any, abs, float, int). If None (default), uses the built-in Equation 10 aggregation."
         },
     )
+
+    unittest_coverage_reward: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Python eval-able expression for coverage/diversity reward over unit tests. "
+            "Uses the same environment as unittest_reward_aggregation (B, correct_mask, M_plus, M_minus, K, etc.). "
+            "Typically measures how well tests distinguish between different incorrect solutions."
+        },
+    )

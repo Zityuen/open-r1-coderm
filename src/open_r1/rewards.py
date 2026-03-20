@@ -29,6 +29,8 @@ import unittest
 from functools import partial, update_wrapper
 from typing import Callable, Dict, Literal, Optional
 
+import numpy as np
+
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
 
@@ -1069,10 +1071,11 @@ def _resolve_cross_solution_reward_from_name(
         )
     # Bake in the aggregation expression if provided.
     if reward_aggregation_expr is not None:
-        single_func = update_wrapper(
-            partial(single_func, reward_aggregation_expr=reward_aggregation_expr),
-            single_func,
-        )
+        partial_func = partial(single_func, reward_aggregation_expr=reward_aggregation_expr)
+        # Preserve the original function name to avoid logging collisions
+        partial_func.__name__ = single_name
+        partial_func.__doc__ = single_func.__doc__
+        single_func = partial_func
 
     return _make_cross_solution_batch_reward(single_func)
 
@@ -1318,13 +1321,30 @@ def get_reward_funcs(script_args) -> list[Callable]:
             reward_funcs.append(dynamic_cross_solution_reward)
             continue
 
+        # Handle custom unittest_* reward expressions from config
+        if func_name.startswith("unittest_") and func_name != "unittest":
+            custom_expr = getattr(script_args, func_name, None)
+            if custom_expr:
+                # Create a reward function using the custom expression
+                base_func = partial(
+                    cross_solution_unittest_reward,
+                    reward_aggregation_expr=custom_expr,
+                )
+                # Set unique name to avoid logging collisions
+                base_func.__name__ = func_name
+                base_func.__doc__ = f"Custom reward: {func_name}"
+                custom_reward = _make_cross_solution_batch_reward(base_func)
+                reward_funcs.append(custom_reward)
+                continue
+
         available = ", ".join(sorted(REWARD_FUNCS_REGISTRY.keys()))
         raise ValueError(
             f"Unknown reward function '{func_name}'. "
             f"Available registry rewards: {available}. "
             "For grouped-solution rewards, you can also use names like "
             "'cross_solution_unittest_v3' if the matching "
-            "'cross_solution_unittest_reward_v3' function exists."
+            "'cross_solution_unittest_reward_v3' function exists. "
+            "For custom unittest rewards, define '{func_name}' in your config yaml."
         )
 
     return reward_funcs
