@@ -17,7 +17,6 @@
 
 import ast
 import asyncio
-import inspect
 import json
 import math
 import os
@@ -807,6 +806,107 @@ def _compute_bik_matrices(
     return canonical_test_ids, B_correct_matrix, B_wrong_matrix
 
 
+def _extract_unittest_code(completion_text: str) -> str:
+    test_code = extract_code(completion_text)
+    if not test_code and ("def " in completion_text or "class " in completion_text):
+        test_code = completion_text
+    return test_code
+
+
+def _build_cross_solution_unittest_context(
+    completion_text: str,
+    solutions: list[dict],
+    timeout: int = 5,
+) -> Optional[dict]:
+    test_code = _extract_unittest_code(completion_text)
+    if not test_code.strip() or not solutions:
+        return None
+
+    correct_mask = np.array([solution["is_correct"] for solution in solutions], dtype=bool)
+    M_plus = int(correct_mask.sum())
+    M_minus = int((~correct_mask).sum())
+    if M_plus + M_minus == 0:
+        return None
+
+    canonical_test_ids, B_correct_matrix, B_wrong_matrix = _compute_bik_matrices(
+        test_code=test_code,
+        solutions=solutions,
+        timeout=timeout,
+    )
+    if not canonical_test_ids:
+        return None
+
+    K = len(canonical_test_ids)
+    B = np.zeros((len(solutions), K), dtype=float)
+    correct_indices = np.flatnonzero(correct_mask)
+    wrong_indices = np.flatnonzero(~correct_mask)
+
+    for k_idx in range(K):
+        if M_plus > 0:
+            B[correct_indices, k_idx] = B_correct_matrix[k_idx]
+        if M_minus > 0:
+            B[wrong_indices, k_idx] = B_wrong_matrix[k_idx]
+
+    return {
+        "B": B,
+        "correct_mask": correct_mask,
+        "M_plus": M_plus,
+        "M_minus": M_minus,
+        "K": K,
+    }
+
+
+def _evaluate_cross_solution_unittest_expr(
+    reward_expr: str,
+    context: dict,
+    reward_name: str,
+) -> float:
+    eval_globals = {
+        "__builtins__": {},
+        **context,
+        "np": np,
+        "math": math,
+        "sum": sum,
+        "len": len,
+        "min": min,
+        "max": max,
+        "float": float,
+        "int": int,
+        "range": range,
+        "zip": zip,
+        "enumerate": enumerate,
+        "all": all,
+        "any": any,
+        "abs": abs,
+    }
+    try:
+        return float(eval(reward_expr, eval_globals))
+    except Exception as exc:
+        print(f"[{reward_name}] reward expression eval failed: {exc}")
+        return 0.0
+
+
+def _expression_based_cross_solution_unittest_reward(
+    completion_text: str,
+    solutions: list[dict],
+    reward_expr: Optional[str],
+    reward_name: str,
+    timeout: int = 5,
+) -> float:
+    if not reward_expr:
+        return 0.0
+
+    context = _build_cross_solution_unittest_context(
+        completion_text=completion_text,
+        solutions=solutions,
+        timeout=timeout,
+    )
+    if context is None:
+        return 0.0
+
+    return _evaluate_cross_solution_unittest_expr(reward_expr, context, reward_name)
+
+
 def cross_solution_unittest_reward(
     completion_text: str,
     solutions: list[dict],
@@ -859,108 +959,38 @@ def cross_solution_unittest_reward(
     Returns:
         Float reward in roughly [-lambda_2, 1 + lambda_1].
     """
-    test_code = extract_code(completion_text)
-    if not test_code and ("def " in completion_text or "class " in completion_text):
-        test_code = completion_text
-
-    if not test_code.strip():
-        return 0.0
-
-    # Prepare index mapping for correct / wrong solutions
-    correct_indices = [i for i, s in enumerate(solutions) if s["is_correct"]]
-    wrong_indices = [i for i, s in enumerate(solutions) if not s["is_correct"]]
-    M_plus = len(correct_indices)
-    M_minus = len(wrong_indices)
-
-    if M_plus + M_minus == 0:
-        return 0.0
-
-    canonical_test_ids, B_correct_matrix, B_wrong_matrix = _compute_bik_matrices(
-        test_code=test_code,
+    context = _build_cross_solution_unittest_context(
+        completion_text=completion_text,
         solutions=solutions,
         timeout=timeout,
     )
-
-    if not canonical_test_ids:
+    if context is None:
         return 0.0
 
-    K = len(canonical_test_ids)
-
-    # -- Custom aggregation via eval --
     if reward_aggregation_expr is not None:
-        # Reconstruct the full B matrix as a numpy array (num_solutions, K)
-        # so the eval expression can use B[correct_mask] / B[~correct_mask].
-        B = np.zeros((M_plus + M_minus, K), dtype=float)
-        for k_idx in range(K):
-            for j, idx in enumerate(correct_indices):
-                B[idx, k_idx] = B_correct_matrix[k_idx][j]
-            for j, idx in enumerate(wrong_indices):
-                B[idx, k_idx] = B_wrong_matrix[k_idx][j]
-        correct_mask = np.array([s["is_correct"] for s in solutions], dtype=bool)
-
-        # NOTE: all variables must live in the *globals* dict because Python 3
-        # comprehensions / generator expressions create implicit function scopes
-        # that only close over globals -- not eval()'s locals dict.
-        eval_globals = {
-            "__builtins__": {},
-            "B": B,
-            "correct_mask": correct_mask,
-            "M_plus": M_plus,
-            "M_minus": M_minus,
-            "K": K,
-            "np": np,
-            "math": math,
-            "sum": sum,
-            "len": len,
-            "min": min,
-            "max": max,
-            "float": float,
-            "int": int,
-            "range": range,
-            "zip": zip,
-            "enumerate": enumerate,
-            "all": all,
-            "any": any,
-            "abs": abs,
-        }
-        try:
-            reward = eval(reward_aggregation_expr, eval_globals)
-            return float(reward)
-        except Exception as e:
-            print(f"[cross_solution_unittest_reward] aggregation eval failed: {e}")
-            return 0.0
-
-    # -- Default: Equation 10 loop-based aggregation --
-    R_fk_scores: list[float] = []
-    B_matrix: list[list[float]] = []  # B_matrix[k] = B_correct_k + B_wrong_k
-    R_details: list[tuple[float, float, float]] = []  # (R1, R_minus, R_fk) per f_k
-
-    for k, _ in enumerate(canonical_test_ids):
-        B_correct = B_correct_matrix[k]
-        B_wrong = B_wrong_matrix[k]
-
-        B_matrix.append(B_correct + B_wrong)
-
-        # R^1_{f_k} (validity)
-        prod_correct = 1.0
-        for b in B_correct:
-            prod_correct *= b
-        sum_correct = sum(B_correct)
-        R1 = prod_correct + (lambda_1 / M_plus * sum_correct if M_plus > 0 else 0.0)
-
-        # R^-_{f_k} (discrimination)
-        prod_wrong = 1.0
-        for b in B_wrong:
-            prod_wrong *= b
-        sum_wrong = sum(B_wrong)
-        R_minus = prod_correct * (1.0 - prod_wrong) - (
-            lambda_2 / M_minus * sum_wrong if M_minus > 0 else 0.0
+        return _evaluate_cross_solution_unittest_expr(
+            reward_expr=reward_aggregation_expr,
+            context=context,
+            reward_name="cross_solution_unittest_reward",
         )
 
-        # R_{f_k} = lambda_t * R^1 + (1 - lambda_t) * R^-
-        R_fk = lambda_t * R1 + (1.0 - lambda_t) * R_minus
-        R_fk_scores.append(R_fk)
-        R_details.append((R1, R_minus, R_fk))
+    B = context["B"]
+    correct_mask = context["correct_mask"]
+    M_plus = context["M_plus"]
+    M_minus = context["M_minus"]
+    K = context["K"]
+    B_correct = B[correct_mask]
+    B_wrong = B[~correct_mask]
+
+    prod_correct = np.prod(B_correct, axis=0) if M_plus > 0 else np.ones(K, dtype=float)
+    sum_correct = np.sum(B_correct, axis=0) if M_plus > 0 else np.zeros(K, dtype=float)
+    prod_wrong = np.prod(B_wrong, axis=0) if M_minus > 0 else np.ones(K, dtype=float)
+    sum_wrong = np.sum(B_wrong, axis=0) if M_minus > 0 else np.zeros(K, dtype=float)
+
+    R1 = prod_correct + (lambda_1 / M_plus * sum_correct if M_plus > 0 else 0.0)
+    R_minus = prod_correct * (1.0 - prod_wrong) - (lambda_2 / M_minus * sum_wrong if M_minus > 0 else 0.0)
+    R_fk_scores = lambda_t * R1 + (1.0 - lambda_t) * R_minus
+
 
     # ── Print B_ik matrix and per-f_k reward breakdown ──
     header = "B_ik matrix (rows=f_k, cols=solutions [correct | wrong]):"
@@ -968,37 +998,17 @@ def cross_solution_unittest_reward(
     col_header = "        " + "  ".join(f"{c:>4}" for c in col_labels)
     print(header)
     print(col_header)
+    B_matrix = B.T.tolist()
     for k, row in enumerate(B_matrix):
         vals = "  ".join(f"{int(v):>4}" for v in row)
         print(f"  f_{k+1:>2}:  {vals}")
     print("Per-f_k rewards:")
-    for k, (r1, rm, rfk) in enumerate(R_details):
+    for k, (r1, rm, rfk) in enumerate(zip(R1, R_minus, R_fk_scores)):
         print(f"  f_{k+1:>2}: R^1={r1:.4f}, R^-={rm:.4f}, R_fk={rfk:.4f}")
-    final_reward = sum(R_fk_scores) / K
+    final_reward = float(np.mean(R_fk_scores))
     print(f"Final reward = {final_reward:.4f} (K={K})")
 
     return final_reward
-
-
-def cross_solution_unittest_batch_reward(
-    completions,
-    sampled_solutions: list[list[dict]],
-    **kwargs,
-) -> list[float]:
-    """
-    Batch wrapper for grouped-solution training.
-
-    Expects one sampled solution set per completion. This adapter allows
-    `cross_solution_unittest_reward` to be used via the standard reward registry.
-    """
-    rewards: list[float] = []
-    for completion, solutions in zip(completions, sampled_solutions):
-        if isinstance(completion, list):
-            completion_text = completion[-1]["content"] if completion else ""
-        else:
-            completion_text = completion
-        rewards.append(cross_solution_unittest_reward(completion_text, solutions))
-    return rewards
 
 
 def _make_cross_solution_batch_reward(single_reward_func: Callable) -> Callable:
@@ -1027,157 +1037,6 @@ def _make_cross_solution_batch_reward(single_reward_func: Callable) -> Callable:
         return rewards
 
     return update_wrapper(_batch_reward, single_reward_func)
-
-
-def _resolve_cross_solution_reward_from_name(
-    func_name: str,
-    reward_aggregation_expr: Optional[str] = None,
-) -> Optional[Callable]:
-    """
-    Resolve grouped-solution reward names to batch-callable reward functions.
-
-    If ``reward_aggregation_expr`` is provided, it is baked into the single reward
-    function via :func:`functools.partial` before wrapping.
-
-    Supported forms:
-      - cross_solution_unittest -> cross_solution_unittest_reward
-      - cross_solution_unittest_v2 -> cross_solution_unittest_reward_v2
-      - cross_solution_unittest_vN -> cross_solution_unittest_reward_vN (preferred)
-      - cross_solution_unittest_reward_vN (backward-compatible)
-    """
-    alias_to_single = {
-        "cross_solution_unittest": "cross_solution_unittest_reward",
-    }
-    if func_name.startswith("cross_solution_unittest_v"):
-        suffix = func_name[len("cross_solution_unittest_") :]
-        alias_to_single[func_name] = f"cross_solution_unittest_reward_{suffix}"
-
-    single_name = alias_to_single.get(func_name, func_name)
-    if not single_name.startswith("cross_solution_unittest_reward"):
-        return None
-
-    single_func = globals().get(single_name)
-    if not callable(single_func):
-        return None
-
-    # Validate expected inputs to fail fast on misnamed functions.
-    sig = inspect.signature(single_func)
-    if not {"completion_text", "solutions"}.issubset(set(sig.parameters.keys())):
-        raise ValueError(
-            f"Reward function '{single_name}' must accept parameters "
-            "'completion_text' and 'solutions'."
-        )
-    # Bake in the aggregation expression if provided.
-    if reward_aggregation_expr is not None:
-        single_func = update_wrapper(
-            partial(single_func, reward_aggregation_expr=reward_aggregation_expr),
-            single_func,
-        )
-
-    return _make_cross_solution_batch_reward(single_func)
-
-
-def cross_solution_unittest_reward_v2(
-    completion_text: str,
-    solutions: list[dict],
-    timeout: int = 5,
-) -> float:
-    """
-    Compute reward for generated unit tests (v2).
-
-    Changes vs v1:
-      - Remove lambda_1 soft-validity term from R^1.
-      - Remove lambda_2 soft-discrimination penalty from R^-.
-      - Combine as direct sum: R_{f_k} = R^1 + R^- (no lambda_t weighting).
-
-    Formulas:
-      R^1_{f_k} = prod(B_ik, i in correct)
-      R^-_{f_k} = prod(B_ik, i in correct) * (1 - prod(B_ik, i in wrong))
-      R_{f_k}   = R^1 + R^-
-      R         = mean(R_{f_k}) over all k
-    """
-    test_code = extract_code(completion_text)
-    if not test_code and ("def " in completion_text or "class " in completion_text):
-        test_code = completion_text
-
-    if not test_code.strip():
-        cross_solution_unittest_reward_v2._last_diagnostic = ""
-        return 0.0
-
-    correct_indices = [i for i, s in enumerate(solutions) if s["is_correct"]]
-    wrong_indices = [i for i, s in enumerate(solutions) if not s["is_correct"]]
-    M_plus = len(correct_indices)
-    M_minus = len(wrong_indices)
-
-    if M_plus + M_minus == 0:
-        cross_solution_unittest_reward_v2._last_diagnostic = ""
-        return 0.0
-
-    canonical_test_ids, B_correct_matrix, B_wrong_matrix = _compute_bik_matrices(
-        test_code=test_code,
-        solutions=solutions,
-        timeout=timeout,
-    )
-    if not canonical_test_ids:
-        cross_solution_unittest_reward_v2._last_diagnostic = ""
-        return 0.0
-
-    K = len(canonical_test_ids)
-    R_fk_scores: list[float] = []
-    B_matrix: list[list[float]] = []  # B_matrix[k] = B_correct_k + B_wrong_k
-    R_details: list[tuple[float, float, float]] = []  # (R1, R_minus, R_fk) per f_k
-
-    for k, _ in enumerate(canonical_test_ids):
-        B_correct = B_correct_matrix[k]
-        B_wrong = B_wrong_matrix[k]
-        B_matrix.append(B_correct + B_wrong)
-
-        prod_correct = 1.0
-        for b in B_correct:
-            prod_correct *= b
-        R1 = prod_correct
-
-        prod_wrong = 1.0
-        for b in B_wrong:
-            prod_wrong *= b
-        R_minus = prod_correct * (1.0 - prod_wrong)
-
-        R_fk = R1 + R_minus
-        R_fk_scores.append(R_fk)
-        R_details.append((R1, R_minus, R_fk))
-
-    diagnostic_rows = []
-    for k, test_id in enumerate(canonical_test_ids):
-        failed_correct = [idx for idx, b in enumerate(B_correct_matrix[k]) if b == 0]
-        passed_wrong = [idx for idx, b in enumerate(B_wrong_matrix[k]) if b == 1]
-        if failed_correct or passed_wrong:
-            diagnostic_rows.append(
-                {
-                    "test_id": test_id,
-                    "failed_correct": failed_correct,
-                    "passed_wrong": passed_wrong,
-                }
-            )
-
-    header = "B_ik matrix (rows=f_k, cols=solutions [correct | wrong]):"
-    col_labels = [f"s+{i}" for i in range(M_plus)] + [f"s-{i}" for i in range(M_minus)]
-    col_header = "        " + "  ".join(f"{c:>4}" for c in col_labels)
-    print(header)
-    print(col_header)
-    for k, row in enumerate(B_matrix):
-        vals = "  ".join(f"{int(v):>4}" for v in row)
-        print(f"  f_{k+1:>2}:  {vals}")
-    print("Per-f_k rewards (v2):")
-    for k, (r1, rm, rfk) in enumerate(R_details):
-        print(f"  f_{k+1:>2}: R^1={r1:.4f}, R^-={rm:.4f}, R_fk={rfk:.4f}")
-    final_reward = sum(R_fk_scores) / K
-    print(f"Final reward v2 = {final_reward:.4f} (K={K})")
-
-    cross_solution_unittest_reward_v2._last_diagnostic = json.dumps(
-        diagnostic_rows, ensure_ascii=False
-    )
-
-    return final_reward
 
 
 def get_code_format_reward(language: str = "python"):
@@ -1289,20 +1148,28 @@ def get_reward_funcs(script_args) -> list[Callable]:
             soft_punish_cache=script_args.soft_punish_cache,
         ),
         "unittest": unittest_reward,
-        "cross_solution_unittest": _make_cross_solution_batch_reward(
-            cross_solution_unittest_reward
-            if getattr(script_args, "unittest_reward_aggregation", None) is None
-            else update_wrapper(
+        "cross_solution_unittest": _make_cross_solution_batch_reward(cross_solution_unittest_reward),
+        "unittest_reward_aggregation": _make_cross_solution_batch_reward(
+            update_wrapper(
                 partial(
-                    cross_solution_unittest_reward,
-                    reward_aggregation_expr=script_args.unittest_reward_aggregation,
+                    _expression_based_cross_solution_unittest_reward,
+                    reward_expr=getattr(script_args, "unittest_reward_aggregation", None),
+                    reward_name="unittest_reward_aggregation",
                 ),
-                cross_solution_unittest_reward,
+                _expression_based_cross_solution_unittest_reward,
+            )
+        ),
+        "unittest_coverage_reward": _make_cross_solution_batch_reward(
+            update_wrapper(
+                partial(
+                    _expression_based_cross_solution_unittest_reward,
+                    reward_expr=getattr(script_args, "unittest_coverage_reward", None),
+                    reward_name="unittest_coverage_reward",
+                ),
+                _expression_based_cross_solution_unittest_reward,
             )
         ),
     }
-
-    reward_aggregation_expr = getattr(script_args, "unittest_reward_aggregation", None)
 
     reward_funcs: list[Callable] = []
     for func_name in script_args.reward_funcs:
@@ -1310,21 +1177,10 @@ def get_reward_funcs(script_args) -> list[Callable]:
             reward_funcs.append(REWARD_FUNCS_REGISTRY[func_name])
             continue
 
-        dynamic_cross_solution_reward = _resolve_cross_solution_reward_from_name(
-            func_name,
-            reward_aggregation_expr=reward_aggregation_expr,
-        )
-        if dynamic_cross_solution_reward is not None:
-            reward_funcs.append(dynamic_cross_solution_reward)
-            continue
-
         available = ", ".join(sorted(REWARD_FUNCS_REGISTRY.keys()))
         raise ValueError(
             f"Unknown reward function '{func_name}'. "
-            f"Available registry rewards: {available}. "
-            "For grouped-solution rewards, you can also use names like "
-            "'cross_solution_unittest_v3' if the matching "
-            "'cross_solution_unittest_reward_v3' function exists."
+            f"Available registry rewards: {available}."
         )
 
     return reward_funcs

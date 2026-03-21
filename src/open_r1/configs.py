@@ -349,3 +349,13 @@ class GRPOScriptArguments(ScriptArguments):
             "enumerate, all, any, abs, float, int). If None (default), uses the built-in Equation 10 aggregation."
         },
     )
+    unittest_coverage_reward: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Python eval-able expression for the unittest_coverage_reward grouped-solution reward. "
+            "Available variables: B (np.ndarray of shape (num_solutions, K), B[i,k]==1 if solution i passes "
+            "test k), correct_mask (np.ndarray bool), M_plus (int), M_minus (int), K (int), np (numpy module), "
+            "math module, and common builtins (sum, len, min, max, range, zip, enumerate, all, any, abs, "
+            "float, int)."
+        },
+    )
