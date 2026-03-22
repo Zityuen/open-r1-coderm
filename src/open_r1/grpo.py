@@ -192,11 +192,13 @@ def main(script_args, training_args, model_args, cli_config_path=None):
         eval_dataset=(dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None),
         peft_config=get_peft_config(model_args),
         callbacks=get_callbacks(training_args, model_args),
-        processing_class=tokenizer,
+        processing_class=tokenizer,å
         num_sampled_solutions=m,
         num_completions_per_solution=n,
         system_prompt_template=SYSTEM_PROMPT if training_args.system_prompt is not None else None,
         user_prompt_template=USER_PROMPT,
+        grpo_unittest_credit_assignment=getattr(script_args, "grpo_unittest_credit_assignment", False),
+        unittest_reward_per_test_expr=getattr(script_args, "unittest_reward_per_test_expr", None),
     )
 
     ###############

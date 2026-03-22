@@ -263,7 +263,7 @@ class GRPOConfig(TrainingArguments):
     )
 
     # Parameters that control generation
-    generation_batch_size: Optional[int] = field(
+    num_generations: Optional[int] = field(
         default=None,
         metadata={
             "help": "Batch size to use for generation. If `None`, it defaults to the effective training batch size: "
