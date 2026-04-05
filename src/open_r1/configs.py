@@ -359,3 +359,22 @@ class GRPOScriptArguments(ScriptArguments):
             "float, int)."
         },
     )
+
+    grpo_unittest_credit_assignment: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, GroupedSolGRPOTrainer assigns unittest aggregation reward to tokens inside each "
+            "test method (AST + tokenizer) and normalizes per-test values across all tests in the whole "
+            "num_generations group. Requires unittest_reward_per_test_expr and a fast tokenizer with "
+            "offset mappings for token alignment."
+        },
+    )
+
+    unittest_reward_per_test_expr: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Python expression evaluated to a length-K vector (one scalar per semantic unittest method), "
+            "using the same variables as unittest_reward_aggregation. Used when grpo_unittest_credit_assignment "
+            "is True (omit the outer mean; use the inner per-column numpy expression)."
+        },
+    )

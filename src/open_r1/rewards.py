@@ -20,13 +20,15 @@ import asyncio
 import json
 import math
 import os
+
+import numpy as np
 import re
 import subprocess
 import sys
 import tempfile
 import unittest
 from functools import partial, update_wrapper
-from typing import Callable, Dict, Literal, Optional
+from typing import Any, Callable, Dict, Literal, Optional
 
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
@@ -853,6 +855,7 @@ def _build_cross_solution_unittest_context(
         "M_plus": M_plus,
         "M_minus": M_minus,
         "K": K,
+        "canonical_test_ids": list(canonical_test_ids),
     }
 
 
@@ -884,6 +887,47 @@ def _evaluate_cross_solution_unittest_expr(
     except Exception as exc:
         print(f"[{reward_name}] reward expression eval failed: {exc}")
         return 0.0
+
+
+def _evaluate_cross_solution_unittest_per_test_vector(
+    reward_expr: Optional[str],
+    context: dict,
+    reward_name: str,
+) -> Optional[np.ndarray]:
+    """Evaluate an expression that must yield a length-K vector (one value per semantic test)."""
+    if not reward_expr:
+        return None
+    K = int(context["K"])
+    eval_globals = {
+        "__builtins__": {},
+        **context,
+        "np": np,
+        "math": math,
+        "sum": sum,
+        "len": len,
+        "min": min,
+        "max": max,
+        "float": float,
+        "int": int,
+        "range": range,
+        "zip": zip,
+        "enumerate": enumerate,
+        "all": all,
+        "any": any,
+        "abs": abs,
+    }
+    try:
+        raw = eval(reward_expr, eval_globals)
+        arr = np.asarray(raw, dtype=np.float64).reshape(-1)
+        if arr.size != K:
+            print(
+                f"[{reward_name}] per-test expression must return length K={K}, got size {arr.size}"
+            )
+            return None
+        return arr
+    except Exception as exc:
+        print(f"[{reward_name}] per-test reward expression eval failed: {exc}")
+        return None
 
 
 def _expression_based_cross_solution_unittest_reward(
@@ -1039,6 +1083,78 @@ def _make_cross_solution_batch_reward(single_reward_func: Callable) -> Callable:
     return update_wrapper(_batch_reward, single_reward_func)
 
 
+def cross_solution_unittest_reward_credit_single(
+    completion_text: str,
+    solutions: list[dict],
+    reward_expr: Optional[str],
+    per_test_expr: Optional[str],
+    reward_name: str,
+    timeout: int = 5,
+) -> tuple[float, Optional[dict[str, Any]]]:
+    """
+    Scalar reward (same aggregation as expression-based unittest) plus optional credit payload
+    for per-test-token assignment. ``per_test_expr`` must evaluate to a length-K vector.
+    """
+    context = _build_cross_solution_unittest_context(
+        completion_text=completion_text,
+        solutions=solutions,
+        timeout=timeout,
+    )
+    if context is None:
+        return 0.0, None
+    scalar = (
+        _evaluate_cross_solution_unittest_expr(reward_expr, context, reward_name)
+        if reward_expr
+        else 0.0
+    )
+    vec = _evaluate_cross_solution_unittest_per_test_vector(
+        per_test_expr, context, f"{reward_name}_per_test"
+    )
+    test_code = _extract_unittest_code(completion_text)
+    if vec is None:
+        return float(scalar), None
+    payload: dict[str, Any] = {
+        "canonical_test_ids": list(context["canonical_test_ids"]),
+        "per_test_rewards": [float(x) for x in vec.tolist()],
+        "test_code": test_code,
+    }
+    return float(scalar), payload
+
+
+def make_unittest_credit_batch_reward(
+    reward_expr: Optional[str],
+    per_test_expr: Optional[str],
+    reward_name: str,
+    timeout: int = 5,
+) -> Callable:
+    """Batch GRPO reward that attaches ``_last_credit_payload`` aligned with completions."""
+
+    def _batch_reward(completions, sampled_solutions, **kwargs) -> list[float]:
+        rewards: list[float] = []
+        payloads: list[Optional[dict[str, Any]]] = []
+        for completion, solutions in zip(completions, sampled_solutions):
+            if isinstance(completion, list):
+                completion_text = completion[-1]["content"] if completion else ""
+            else:
+                completion_text = completion
+            scalar, payload = cross_solution_unittest_reward_credit_single(
+                completion_text,
+                solutions,
+                reward_expr,
+                per_test_expr,
+                reward_name,
+                timeout,
+            )
+            rewards.append(scalar)
+            payloads.append(payload)
+        _batch_reward._last_credit_payload = payloads
+        return rewards
+
+    # Match registry key so GRPOTrainer metrics and GroupedSolGRPOTrainer credit index stay aligned.
+    _batch_reward.__name__ = reward_name
+    return _batch_reward
+
+
 def get_code_format_reward(language: str = "python"):
     """Format reward function specifically for code responses.
 
@@ -1149,14 +1265,22 @@ def get_reward_funcs(script_args) -> list[Callable]:
         ),
         "unittest": unittest_reward,
         "cross_solution_unittest": _make_cross_solution_batch_reward(cross_solution_unittest_reward),
-        "unittest_reward_aggregation": _make_cross_solution_batch_reward(
-            update_wrapper(
-                partial(
+        "unittest_reward_aggregation": (
+            make_unittest_credit_batch_reward(
+                reward_expr=getattr(script_args, "unittest_reward_aggregation", None),
+                per_test_expr=getattr(script_args, "unittest_reward_per_test_expr", None),
+                reward_name="unittest_reward_aggregation",
+            )
+            if getattr(script_args, "grpo_unittest_credit_assignment", False)
+            else _make_cross_solution_batch_reward(
+                update_wrapper(
+                    partial(
+                        _expression_based_cross_solution_unittest_reward,
+                        reward_expr=getattr(script_args, "unittest_reward_aggregation", None),
+                        reward_name="unittest_reward_aggregation",
+                    ),
                     _expression_based_cross_solution_unittest_reward,
-                    reward_expr=getattr(script_args, "unittest_reward_aggregation", None),
-                    reward_name="unittest_reward_aggregation",
-                ),
-                _expression_based_cross_solution_unittest_reward,
+                )
             )
         ),
         "unittest_coverage_reward": _make_cross_solution_batch_reward(

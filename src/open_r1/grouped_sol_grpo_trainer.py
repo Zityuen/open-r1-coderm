@@ -4,6 +4,7 @@ import warnings
 from contextlib import nullcontext
 from typing import Any, Optional, Union
 
+import numpy as np
 import torch
 from accelerate.utils import broadcast_object_list, gather, gather_object
 from torch import nn
@@ -15,6 +16,7 @@ from open_r1.trl.import_utils import is_vllm_available
 from open_r1.trl.models import unwrap_model_for_generation
 from open_r1.trl.trainer.grpo_trainer import GRPOTrainer, nanstd
 from open_r1.trl.trainer.utils import pad
+from open_r1.unittest_credit import build_per_token_unittest_advantages, pooled_normalize_per_test_values
 
 if is_vllm_available():
     from vllm import SamplingParams
@@ -32,6 +34,10 @@ class GroupedSolGRPOTrainer(GRPOTrainer):
     and all of its solutions. At generation time, m solutions are sampled without replacement,
     m prompts are constructed, and n completions are generated per prompt (m * n = num_generations).
     Rewards are computed via cross-solution unit test execution.
+
+    Optional ``grpo_unittest_credit_assignment`` (with ``unittest_reward_per_test_expr`` in script
+    config) enables per-test-method token credit and pooled normalization over all semantic tests
+    in the ``num_generations`` group.
     """
 
     def __init__(
@@ -41,6 +47,8 @@ class GroupedSolGRPOTrainer(GRPOTrainer):
         num_completions_per_solution: int = 4,
         system_prompt_template: Optional[str] = None,
         user_prompt_template: str = "",
+        grpo_unittest_credit_assignment: bool = False,
+        unittest_reward_per_test_expr: Optional[str] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -49,12 +57,30 @@ class GroupedSolGRPOTrainer(GRPOTrainer):
         self.n = num_completions_per_solution
         self.system_prompt_template = system_prompt_template
         self.user_prompt_template = user_prompt_template
+        self.grpo_unittest_credit_assignment = grpo_unittest_credit_assignment
+        self.unittest_reward_per_test_expr = unittest_reward_per_test_expr
+        self._unittest_reward_idx = next(
+            (i for i, n in enumerate(self.reward_func_names) if n == "unittest_reward_aggregation"),
+            None,
+        )
 
         if self.m * self.n != self.num_generations:
             raise ValueError(
                 f"num_sampled_solutions ({self.m}) * num_completions_per_solution ({self.n}) "
                 f"must equal num_generations ({self.num_generations}), got {self.m * self.n}"
             )
+
+        if self.grpo_unittest_credit_assignment:
+            if not self.unittest_reward_per_test_expr:
+                logger.warning(
+                    "grpo_unittest_credit_assignment is True but unittest_reward_per_test_expr is unset; "
+                    "per-test credit payloads may be empty and unittest advantages fall back to the scalar GRPO path."
+                )
+            if self.use_liger_loss:
+                logger.warning(
+                    "unittest credit assignment uses per-token advantages; disabling use_liger_loss for this trainer."
+                )
+                self.use_liger_loss = False
 
     def _set_signature_columns_if_needed(self):
         if self._signature_columns is None:
@@ -345,28 +371,176 @@ class GroupedSolGRPOTrainer(GRPOTrainer):
             )
 
         # ------------------------------------------------------------------
-        # Phase 6: Gather, normalise, compute advantages (same as base)
+        # Phase 6: Gather, normalise, compute advantages
         # ------------------------------------------------------------------
         rewards_per_func = gather(rewards_per_func)
 
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
 
-        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
-        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
-        is_std_zero = torch.isclose(std_grouped_rewards, torch.zeros_like(std_grouped_rewards))
+        G = self.num_generations
+        mean_grouped = rewards.view(-1, G).mean(dim=1)
+        std_grouped = rewards.view(-1, G).std(dim=1)
+        is_std_zero = torch.isclose(std_grouped, torch.zeros_like(std_grouped))
 
-        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        advantages = rewards - mean_grouped_rewards
-        if self.scale_rewards:
-            advantages = advantages / (std_grouped_rewards + 1e-4)
+        # expand the mean and std of the grouped rewards to the number of generations
+        mean_grouped_rewards_exp = mean_grouped.repeat_interleave(G, dim=0)
+        std_grouped_rewards_exp = std_grouped.repeat_interleave(G, dim=0)
 
         process_slice = slice(
             self.accelerator.process_index * len(prompts),
             (self.accelerator.process_index + 1) * len(prompts),
         )
-        all_process_advantages = advantages.clone()
-        advantages = advantages[process_slice]
+
+        if self.grpo_unittest_credit_assignment and self._unittest_reward_idx is not None:
+            ut_idx = self._unittest_reward_idx
+            w_ut = self.reward_weights[ut_idx].to(device=device, dtype=rewards.dtype)
+            rut = torch.nan_to_num(rewards_per_func[:, ut_idx], nan=0.0)
+            rewards_ex_ut = rewards - w_ut * rut
+
+            mean_ex = rewards_ex_ut.view(-1, G).mean(dim=1).repeat_interleave(G, dim=0)
+            std_ex = rewards_ex_ut.view(-1, G).std(dim=1).repeat_interleave(G, dim=0)
+            adv_other = rewards_ex_ut - mean_ex
+            if self.scale_rewards:
+                adv_other = adv_other / (std_ex + 1e-4)
+
+            adv_full = rewards - mean_grouped_rewards_exp
+            if self.scale_rewards:
+                adv_full = adv_full / (std_grouped_rewards_exp + 1e-4)
+
+            ut_fn = self.reward_funcs[ut_idx]
+            local_payloads = getattr(ut_fn, "_last_credit_payload", None)
+            if local_payloads is None or len(local_payloads) != len(prompts):
+                local_payloads = [None] * len(prompts)
+            credit_all = gather_object(local_payloads)
+
+            raw_by_row: list[Optional[list[float]]] = []
+            for p in credit_all:
+                if p and p.get("per_test_rewards"):
+                    raw_by_row.append([float(x) for x in p["per_test_rewards"]])
+                else:
+                    raw_by_row.append(None)
+            # normalization over number of semantic test functions
+            # e.g., num_generation = 4, semantic test functions = [2,3,4,5] respectively
+            # then we need to normalize over 2 + 3 + 4 + 5 = 14 tests
+            normed_rows = pooled_normalize_per_test_values(
+                raw_by_row, G, self.scale_rewards,
+            )
+
+            ut_name = self.reward_func_names[ut_idx]
+            n_global = len(credit_all)
+            flat_raw: list[float] = []
+            flat_centered: list[float] = []
+            for r in raw_by_row:
+                if r:
+                    flat_raw.extend(r)
+            for r in normed_rows:
+                if r:
+                    flat_centered.extend(r)
+
+            frac_payload = (
+                sum(1 for p in credit_all if p and p.get("per_test_rewards")) / n_global
+                if n_global
+                else float("nan")
+            )
+            credit_applied_n = 0
+            test_counts_when_applied: list[int] = []
+            for gidx in range(n_global):
+                pl = credit_all[gidx]
+                centered = normed_rows[gidx]
+                if (
+                    pl
+                    and centered
+                    and len(centered) > 0
+                    and pl.get("canonical_test_ids")
+                    and pl.get("test_code")
+                ):
+                    credit_applied_n += 1
+                    test_counts_when_applied.append(len(centered))
+            frac_applied = credit_applied_n / n_global if n_global else float("nan")
+
+            pr = self._metrics[mode]
+            # Scalar ``rewards/unittest_reward_aggregation/mean`` (below) is still the expression aggregate
+            # (e.g. float(np.mean(...))) — same as non-credit. These metrics reflect per-test pooling.
+            if flat_raw:
+                pr[f"rewards/{ut_name}/mean_over_semantic_tests_raw"].append(float(np.mean(flat_raw)))
+                pr[f"rewards/{ut_name}/std_over_semantic_tests_raw"].append(float(np.std(flat_raw)))
+            else:
+                pr[f"rewards/{ut_name}/mean_over_semantic_tests_raw"].append(float("nan"))
+                pr[f"rewards/{ut_name}/std_over_semantic_tests_raw"].append(float("nan"))
+            if flat_centered:
+                pr[f"rewards/{ut_name}/mean_over_semantic_tests_centered"].append(
+                    float(np.mean(flat_centered))
+                )
+                pr[f"rewards/{ut_name}/mean_abs_semantic_tests_centered"].append(
+                    float(np.mean(np.abs(flat_centered)))
+                )
+            else:
+                pr[f"rewards/{ut_name}/mean_over_semantic_tests_centered"].append(float("nan"))
+                pr[f"rewards/{ut_name}/mean_abs_semantic_tests_centered"].append(float("nan"))
+            pr["unittest_credit/frac_rows_with_payload"].append(frac_payload)
+            pr["unittest_credit/frac_rows_credit_applied"].append(frac_applied)
+            pr["unittest_credit/mean_num_tests_when_applied"].append(
+                float(np.mean(test_counts_when_applied)) if test_counts_when_applied else float("nan")
+            )
+
+            T = completion_ids.size(1)
+            advantages = torch.zeros(len(prompts), T, device=device, dtype=torch.float32)
+            adv_other_local = adv_other[process_slice]
+            adv_full_local = adv_full[process_slice]
+
+            local_token_coverage: list[float] = []
+            for i in range(len(prompts)):
+                gidx = self.accelerator.process_index * len(prompts) + i
+                mask_row = completion_mask[i].float()
+                eff_len = int(mask_row.sum().item())
+                pl = credit_all[gidx] if 0 <= gidx < len(credit_all) else None
+                centered = normed_rows[gidx] if 0 <= gidx < len(normed_rows) else None
+
+                if (
+                    pl
+                    and centered
+                    and len(centered) > 0
+                    and pl.get("canonical_test_ids")
+                    and pl.get("test_code")
+                ):
+                    tok = build_per_token_unittest_advantages(
+                        self.processing_class,
+                        completions_text[i],
+                        pl["test_code"],
+                        pl["canonical_test_ids"],
+                        centered,
+                        eff_len,
+                    )
+                    ut_tok = torch.zeros(T, device=device, dtype=torch.float32)
+                    L = min(int(tok.shape[0]), T)
+                    ut_tok[:L] = torch.as_tensor(tok[:L], device=device, dtype=torch.float32)
+                    ut_tok = ut_tok * mask_row
+                    advantages[i] = adv_other_local[i] + w_ut * ut_tok
+                    n_ut = (ut_tok.abs() > 1e-8).sum().item()
+                    local_token_coverage.append(n_ut / max(eff_len, 1))
+                else:
+                    advantages[i] = adv_full_local[i] * mask_row
+
+            cov_local = float(np.mean(local_token_coverage)) if local_token_coverage else float("nan")
+            cov_t = torch.tensor([cov_local], device=device, dtype=torch.float32)
+            pr["unittest_credit/mean_token_coverage_when_applied"].append(
+                self.accelerator.gather(cov_t).nanmean().item()
+            )
+
+            # Per-completion mean of pooled-centered per-test values (for tables / debugging).
+            self._unittest_credit_row_centered_means = [
+                float(np.mean(normed_rows[g])) if normed_rows[g] else float("nan")
+                for g in range(len(normed_rows))
+            ]
+
+            all_process_advantages = adv_full.clone()
+        else:
+            self._unittest_credit_row_centered_means = None
+            advantages_global = rewards - mean_grouped_rewards_exp
+            if self.scale_rewards:
+                advantages_global = advantages_global / (std_grouped_rewards_exp + 1e-4)
+            all_process_advantages = advantages_global.clone()
+            advantages = advantages_global[process_slice]
 
         # ------------------------------------------------------------------
         # Phase 7: Logging (same as base)
@@ -409,8 +583,8 @@ class GroupedSolGRPOTrainer(GRPOTrainer):
             self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
             std_rewards = nanstd(rewards_per_func[:, i]).item()
             self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_rewards)
-        self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
-        self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
+        self._metrics[mode]["reward"].append(mean_grouped_rewards_exp.mean().item())
+        self._metrics[mode]["reward_std"].append(std_grouped_rewards_exp.mean().item())
         self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
 
         gathered_prompts_text = gather_object(prompts_text)
@@ -422,6 +596,11 @@ class GroupedSolGRPOTrainer(GRPOTrainer):
             self._textual_logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
             gathered_diagnostics = gather_object(reward_diagnostics_local[name])
             self._textual_logs["reward_diagnostics"][name].extend(gathered_diagnostics)
+        if self.grpo_unittest_credit_assignment and self._unittest_reward_idx is not None:
+            means = getattr(self, "_unittest_credit_row_centered_means", None)
+            if means is not None:
+                u = self.reward_func_names[self._unittest_reward_idx]
+                self._textual_logs["rewards"][f"{u}_per_completion_mean_centered"].extend(means)
         self._textual_logs["advantages"].extend(all_process_advantages.tolist())
 
         return {

@@ -1314,6 +1314,11 @@ class GRPOTrainer(Trainer):
         # get the last hidden state of the model
         last_hidden_state = self._get_last_hidden_state(unwrapped_model, input_ids, attention_mask, logits_to_keep)
 
+        if inputs["advantages"].dim() != 1:
+            raise ValueError(
+                "Per-token advantages (2D) require use_liger_loss=False (e.g. GroupedSolGRPOTrainer disables "
+                "Liger when unittest credit assignment is enabled)."
+            )
         # compute loss and metrics using liger grpo loss
         loss, metrics = self.liger_grpo_loss(
             _input=last_hidden_state,
@@ -1377,6 +1382,7 @@ class GRPOTrainer(Trainer):
 
         # Compute the loss
         advantages = inputs["advantages"]
+        adv = advantages.unsqueeze(1) if advantages.dim() == 1 else advantages
         # When using num_iterations == 1 and steps_per_generation <= gradient_accumulation_steps
         # old_per_token_logps == per_token_logps, so we can skip it's computation
         # (see _generate_and_score_completions) and use per_token_logps.detach() instead.
@@ -1390,8 +1396,8 @@ class GRPOTrainer(Trainer):
         if self.args.delta is not None:
             coef_1 = torch.clamp(coef_1, max=self.args.delta)
 
-        per_token_loss1 = coef_1 * advantages.unsqueeze(1)
-        per_token_loss2 = coef_2 * advantages.unsqueeze(1)
+        per_token_loss1 = coef_1 * adv
+        per_token_loss2 = coef_2 * adv
         per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
         if self.beta != 0.0:
             per_token_loss = per_token_loss + self.beta * per_token_kl
@@ -1417,8 +1423,8 @@ class GRPOTrainer(Trainer):
         self._metrics[mode]["entropy"].append(self.accelerator.gather(mean_entropy).nanmean().item())
 
         # Compute the clipped probability ratios
-        is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages.unsqueeze(1) < 0)
-        is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages.unsqueeze(1) > 0)
+        is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (adv < 0)
+        is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (adv > 0)
         is_region_clipped = is_low_clipped | is_high_clipped
 
         low_clip = (is_low_clipped * completion_mask).sum() / completion_mask.sum()
