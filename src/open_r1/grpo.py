@@ -39,7 +39,22 @@ USER_PROMPT = """
 ### question
 {question}
 ### code solution
+<<<<<<< HEAD
 {code_solution}
+=======
+{code}
+Please add detailed comments to the test cases you write. You do not need to test the function's ability to throw exceptions.
+"""
+
+SYSTEM_PROMPT_SIGNATURE = """
+Below is a question and it's corresponding illustration. Please write test cases to check the correctness of the code answer. You need to use the unittest library in Python and create a test class for testing.
+"""
+USER_PROMPT_SIGNATURE = """
+### question
+{question}
+### illustration
+{code}
+>>>>>>> cbbd390 (support signature based training)
 Please add detailed comments to the test cases you write. You do not need to test the function's ability to throw exceptions.
 """
 
@@ -99,6 +114,12 @@ def main(script_args, training_args, model_args, cli_config_path=None):
     # Load the dataset
     dataset = get_dataset(script_args)
 
+    if script_args.use_signature:
+        for split_ds in dataset.values():
+            assert "signature_comment" in split_ds.column_names, (
+                "use_signature=True requires a 'signature_comment' column in every dataset split."
+            )
+
     ################
     # Load tokenizer
     ################
@@ -129,7 +150,11 @@ def main(script_args, training_args, model_args, cli_config_path=None):
                 sols.append({"solve_func": sol["solve_func"], "is_correct": False})
             all_solutions.append(sols)
 
-        return {"prompt_question": questions, "solutions": all_solutions}
+        out = {"prompt_question": questions, "solutions": all_solutions}
+        if script_args.use_signature:
+            out["solutions"] = []
+            out["signature_comment"] = example["signature_comment"]
+        return out
 
     # Remove original columns to avoid length mismatch (ArrowInvalid)
     # as make_conversation doubles the number of rows (correct + wrong solutions)
@@ -154,7 +179,8 @@ def main(script_args, training_args, model_args, cli_config_path=None):
             question = example["prompt_question"]
             kept = [
                 sol for sol in example["solutions"]
-                if _prompt_length(question, sol["solve_func"]) <= training_args.max_prompt_length
+                if (_prompt_length(question, sol["solve_func"]) <= training_args.max_prompt_length and not script_args.use_signature)
+                or (_prompt_length(question, example["signature_comment"]) <= training_args.max_prompt_length and script_args.use_signature)
             ]
             example["solutions"] = kept
             return example
@@ -195,10 +221,16 @@ def main(script_args, training_args, model_args, cli_config_path=None):
         processing_class=tokenizer,å
         num_sampled_solutions=m,
         num_completions_per_solution=n,
+<<<<<<< HEAD
         system_prompt_template=SYSTEM_PROMPT if training_args.system_prompt is not None else None,
         user_prompt_template=USER_PROMPT,
         grpo_unittest_credit_assignment=getattr(script_args, "grpo_unittest_credit_assignment", False),
         unittest_reward_per_test_expr=getattr(script_args, "unittest_reward_per_test_expr", None),
+=======
+        system_prompt_template=SYSTEM_PROMPT if not script_args.use_signature else SYSTEM_PROMPT_SIGNATURE,
+        user_prompt_template=USER_PROMPT if not script_args.use_signature else USER_PROMPT_SIGNATURE,
+        use_signature=script_args.use_signature,
+>>>>>>> cbbd390 (support signature based training)
     )
 
     ###############

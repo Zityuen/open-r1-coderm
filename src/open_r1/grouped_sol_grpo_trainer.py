@@ -49,6 +49,7 @@ class GroupedSolGRPOTrainer(GRPOTrainer):
         user_prompt_template: str = "",
         grpo_unittest_credit_assignment: bool = False,
         unittest_reward_per_test_expr: Optional[str] = None,
+        use_signature: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -63,6 +64,7 @@ class GroupedSolGRPOTrainer(GRPOTrainer):
             (i for i, n in enumerate(self.reward_func_names) if n == "unittest_reward_aggregation"),
             None,
         )
+        self.use_signature = use_signature
 
         if self.m * self.n != self.num_generations:
             raise ValueError(
@@ -84,16 +86,19 @@ class GroupedSolGRPOTrainer(GRPOTrainer):
 
     def _set_signature_columns_if_needed(self):
         if self._signature_columns is None:
-            self._signature_columns = ["prompt_question", "solutions"]
+            cols = ["prompt_question", "solutions"]
+            if self.use_signature:
+                cols.append("signature_comment")
+            self._signature_columns = cols
 
-    def _build_prompt(self, question: str, sol_func: str) -> list[dict]:
+    def _build_prompt(self, question: str, code_for_prompt: str) -> list[dict]:
         prompt = []
         if self.system_prompt_template:
             prompt.append({"role": "system", "content": self.system_prompt_template})
         prompt.append({
             "role": "user",
             "content": self.user_prompt_template.format(
-                question=question, code_solution=sol_func,
+                question=question, code=code_for_prompt,
             ),
         })
         return prompt
@@ -132,7 +137,10 @@ class GroupedSolGRPOTrainer(GRPOTrainer):
             sampled_sols = self._sample_solutions(solutions)
 
             for sol in sampled_sols:
-                prompt = self._build_prompt(question, sol["solve_func"])
+                code_for_prompt = (
+                    example["signature_comment"] if self.use_signature else sol["solve_func"]
+                )
+                prompt = self._build_prompt(question, code_for_prompt)
                 for _ in range(self.n):
                     transformed_inputs.append({
                         "prompt": list(prompt),

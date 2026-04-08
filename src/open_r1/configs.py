@@ -339,6 +339,17 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "Number of completions to generate per sampled solution (n). Must satisfy m * n = num_generations."},
     )
 
+<<<<<<< HEAD
+=======
+    use_signature: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, use the dataset column signature_comment as the code block in the user prompt "
+            "instead of each sampled solution's code. Requires signature_comment in the dataset."
+        },
+    )
+
+>>>>>>> cbbd390 (support signature based training)
     unittest_reward_aggregation: Optional[str] = field(
         default=None,
         metadata={
@@ -359,6 +370,7 @@ class GRPOScriptArguments(ScriptArguments):
             "float, int)."
         },
     )
+<<<<<<< HEAD
 
     grpo_unittest_credit_assignment: bool = field(
         default=False,
@@ -378,3 +390,5 @@ class GRPOScriptArguments(ScriptArguments):
             "is True (omit the outer mean; use the inner per-column numpy expression)."
         },
     )
+=======
+>>>>>>> cbbd390 (support signature based training)
