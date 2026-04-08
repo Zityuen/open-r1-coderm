@@ -40,8 +40,11 @@ USER_PROMPT = """
 {question}
 ### code solution
 <<<<<<< HEAD
+<<<<<<< HEAD
 {code_solution}
 =======
+=======
+>>>>>>> cbbd390 (support signature based training)
 {code}
 Please add detailed comments to the test cases you write. You do not need to test the function's ability to throw exceptions.
 """
@@ -54,6 +57,9 @@ USER_PROMPT_SIGNATURE = """
 {question}
 ### illustration
 {code}
+<<<<<<< HEAD
+>>>>>>> cbbd390 (support signature based training)
+=======
 >>>>>>> cbbd390 (support signature based training)
 Please add detailed comments to the test cases you write. You do not need to test the function's ability to throw exceptions.
 """
@@ -222,10 +228,16 @@ def main(script_args, training_args, model_args, cli_config_path=None):
         num_sampled_solutions=m,
         num_completions_per_solution=n,
 <<<<<<< HEAD
+<<<<<<< HEAD
         system_prompt_template=SYSTEM_PROMPT if training_args.system_prompt is not None else None,
         user_prompt_template=USER_PROMPT,
         grpo_unittest_credit_assignment=getattr(script_args, "grpo_unittest_credit_assignment", False),
         unittest_reward_per_test_expr=getattr(script_args, "unittest_reward_per_test_expr", None),
+=======
+        system_prompt_template=SYSTEM_PROMPT if not script_args.use_signature else SYSTEM_PROMPT_SIGNATURE,
+        user_prompt_template=USER_PROMPT if not script_args.use_signature else USER_PROMPT_SIGNATURE,
+        use_signature=script_args.use_signature,
+>>>>>>> cbbd390 (support signature based training)
 =======
         system_prompt_template=SYSTEM_PROMPT if not script_args.use_signature else SYSTEM_PROMPT_SIGNATURE,
         user_prompt_template=USER_PROMPT if not script_args.use_signature else USER_PROMPT_SIGNATURE,

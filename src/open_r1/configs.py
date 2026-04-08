@@ -340,7 +340,10 @@ class GRPOScriptArguments(ScriptArguments):
     )
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 =======
+=======
+>>>>>>> cbbd390 (support signature based training)
     use_signature: bool = field(
         default=False,
         metadata={
@@ -349,6 +352,9 @@ class GRPOScriptArguments(ScriptArguments):
         },
     )
 
+<<<<<<< HEAD
+>>>>>>> cbbd390 (support signature based training)
+=======
 >>>>>>> cbbd390 (support signature based training)
     unittest_reward_aggregation: Optional[str] = field(
         default=None,
@@ -371,6 +377,7 @@ class GRPOScriptArguments(ScriptArguments):
         },
     )
 <<<<<<< HEAD
+<<<<<<< HEAD
 
     grpo_unittest_credit_assignment: bool = field(
         default=False,
@@ -390,5 +397,7 @@ class GRPOScriptArguments(ScriptArguments):
             "is True (omit the outer mean; use the inner per-column numpy expression)."
         },
     )
+=======
+>>>>>>> cbbd390 (support signature based training)
 =======
 >>>>>>> cbbd390 (support signature based training)
