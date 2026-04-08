@@ -339,6 +339,14 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "Number of completions to generate per sampled solution (n). Must satisfy m * n = num_generations."},
     )
 
+    use_signature: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, use the dataset column signature_comment as the code block in the user prompt "
+            "instead of each sampled solution's code. Requires signature_comment in the dataset."
+        },
+    )
+
     unittest_reward_aggregation: Optional[str] = field(
         default=None,
         metadata={
