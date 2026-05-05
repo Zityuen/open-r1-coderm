@@ -49,6 +49,8 @@ class TestGetRewardFuncs(unittest.TestCase):
             "ioi_code",
             "code_format",
             "binary_code",
+            "unittest_reward_aggregation",
+            "unittest_coverage_reward",
         ]
         reward_func_names = [
             "accuracy_reward",
@@ -62,6 +64,8 @@ class TestGetRewardFuncs(unittest.TestCase):
             "ioi_code_reward",
             "code_format_reward",
             "binary_code_reward",
+            "unittest_reward_aggregation",
+            "unittest_coverage_reward",
         ]
 
         args = GRPOScriptArguments(
@@ -70,7 +74,7 @@ class TestGetRewardFuncs(unittest.TestCase):
         )
 
         reward_funcs = get_reward_funcs(args)
-        self.assertEqual(len(reward_funcs), 11)
+        self.assertEqual(len(reward_funcs), 13)
         for func_name, func in zip(reward_func_names, reward_funcs):
             self.assertEqual(func_name, func.__name__)
 

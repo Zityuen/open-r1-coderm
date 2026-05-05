@@ -28,6 +28,7 @@ import unittest
 from functools import partial, update_wrapper
 from typing import Callable, Dict, Literal, Optional
 
+import numpy as np
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
 
@@ -1039,6 +1040,20 @@ def _make_cross_solution_batch_reward(single_reward_func: Callable) -> Callable:
     return update_wrapper(_batch_reward, single_reward_func)
 
 
+def _make_expression_based_cross_solution_batch_reward(reward_expr: Optional[str], reward_name: str) -> Callable:
+    single_reward_func = update_wrapper(
+        partial(
+            _expression_based_cross_solution_unittest_reward,
+            reward_expr=reward_expr,
+            reward_name=reward_name,
+        ),
+        _expression_based_cross_solution_unittest_reward,
+    )
+    single_reward_func.__name__ = reward_name
+    single_reward_func.__qualname__ = reward_name
+    return _make_cross_solution_batch_reward(single_reward_func)
+
+
 def get_code_format_reward(language: str = "python"):
     """Format reward function specifically for code responses.
 
@@ -1149,25 +1164,13 @@ def get_reward_funcs(script_args) -> list[Callable]:
         ),
         "unittest": unittest_reward,
         "cross_solution_unittest": _make_cross_solution_batch_reward(cross_solution_unittest_reward),
-        "unittest_reward_aggregation": _make_cross_solution_batch_reward(
-            update_wrapper(
-                partial(
-                    _expression_based_cross_solution_unittest_reward,
-                    reward_expr=getattr(script_args, "unittest_reward_aggregation", None),
-                    reward_name="unittest_reward_aggregation",
-                ),
-                _expression_based_cross_solution_unittest_reward,
-            )
+        "unittest_reward_aggregation": _make_expression_based_cross_solution_batch_reward(
+            reward_expr=getattr(script_args, "unittest_reward_aggregation", None),
+            reward_name="unittest_reward_aggregation",
         ),
-        "unittest_coverage_reward": _make_cross_solution_batch_reward(
-            update_wrapper(
-                partial(
-                    _expression_based_cross_solution_unittest_reward,
-                    reward_expr=getattr(script_args, "unittest_coverage_reward", None),
-                    reward_name="unittest_coverage_reward",
-                ),
-                _expression_based_cross_solution_unittest_reward,
-            )
+        "unittest_coverage_reward": _make_expression_based_cross_solution_batch_reward(
+            reward_expr=getattr(script_args, "unittest_coverage_reward", None),
+            reward_name="unittest_coverage_reward",
         ),
     }
 
